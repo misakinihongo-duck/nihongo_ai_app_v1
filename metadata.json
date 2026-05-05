@@ -1,0 +1,6 @@
+{
+  "name": "NIHONGO AI Assistant v6- Add separate log in system (Teacher and Student)",
+  "description": "Japanese learning assistant that generates JLPT-leveled articles, manages student writings with furigana, and creates custom grammar quizzes.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

@@ -1,0 +1,102 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(authorId) {
+      return isSignedIn() && request.auth.uid == authorId;
+    }
+
+    function getUserData(userId) {
+      return get(/databases/$(database)/documents/users/$(userId)).data;
+    }
+
+    function isTeacher() {
+      return isSignedIn() && getUserData(request.auth.uid).role == 'teacher';
+    }
+
+    function isStudent() {
+      return isSignedIn() && getUserData(request.auth.uid).role == 'student';
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // User Profiles
+    match /users/{userId} {
+      function isValidUser(data) {
+        return data.keys().hasAll(['uid', 'email', 'role', 'createdAt']) &&
+               data.uid == request.auth.uid &&
+               data.role in ['teacher', 'student'] &&
+               data.createdAt == request.time;
+      }
+
+      allow read: if isSignedIn(); // Teachers need to read student info, students might need teacher info
+      allow create: if isSignedIn() && request.auth.uid == userId && isValidUser(request.resource.data);
+      allow update: if isSignedIn() && request.auth.uid == userId && 
+                       request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName', 'email']) &&
+                       request.resource.data.role == resource.data.role; // Immutable role
+    }
+
+    // Writings
+    match /writings/{writingId} {
+      function isValidWriting(data) {
+        return data.keys().hasAll(['title', 'content', 'authorId', 'createdAt']) &&
+               data.title is string && data.title.size() <= 500 &&
+               data.content is string && data.content.size() <= 50000 &&
+               data.authorId == request.auth.uid &&
+               data.createdAt == request.time;
+      }
+
+      allow read: if isSignedIn() && (isOwner(resource.data.authorId) || isTeacher());
+      allow list: if isSignedIn() && (isOwner(resource.data.authorId) || isTeacher());
+      allow create: if isSignedIn() && isValidWriting(request.resource.data);
+      allow update: if isSignedIn() && isValidId(writingId) && (isOwner(resource.data.authorId) || isTeacher());
+      allow delete: if isSignedIn() && isValidId(writingId) && isOwner(resource.data.authorId);
+    }
+
+    // Quizzes
+    match /quizzes/{quizId} {
+      function isValidQuiz(data) {
+        return data.keys().hasAll(['topic', 'level', 'questions', 'authorId', 'createdAt']) &&
+               isTeacher() &&
+               data.authorId == request.auth.uid &&
+               data.createdAt == request.time;
+      }
+
+      allow read: if isSignedIn();
+      allow list: if isSignedIn();
+      allow create: if isTeacher() && isValidQuiz(request.resource.data);
+      allow update, delete: if isTeacher() && isOwner(resource.data.authorId);
+    }
+
+    // Articles
+    match /articles/{articleId} {
+      function isValidArticle(data) {
+        return data.keys().hasAll(['rewrittenText', 'level', 'authorId', 'createdAt']) &&
+               isTeacher() &&
+               data.authorId == request.auth.uid &&
+               data.createdAt == request.time;
+      }
+
+      allow read: if isSignedIn();
+      allow list: if isSignedIn();
+      allow create: if isTeacher() && isValidArticle(request.resource.data);
+      allow update, delete: if isTeacher() && isOwner(resource.data.authorId);
+    }
+
+    // Connection testing
+    match /test/{docId} {
+      allow read: if true;
+    }
+  }
+}
