@@ -1,102 +1,110 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Default deny
-    match /{document=**} {
-      allow read, write: if false;
-    }
-
-    // Helper functions
+    // -------------------------
+    // Basic auth helpers
+    // -------------------------
+    // Meaning: reject every request from users who are not logged in.
     function isSignedIn() {
       return request.auth != null;
     }
 
-    function isOwner(authorId) {
-      return isSignedIn() && request.auth.uid == authorId;
+    // Meaning: true when the target user document belongs to the logged-in user.
+    function isSelf(userId) {
+      return isSignedIn() && request.auth.uid == userId;
     }
 
-    function getUserData(userId) {
-      return get(/databases/$(database)/documents/users/$(userId)).data;
+    // Meaning: safely read the caller's own users/{uid} document.
+    function requesterUser() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
     }
 
+    // Meaning: teacher can read all users documents.
     function isTeacher() {
-      return isSignedIn() && getUserData(request.auth.uid).role == 'teacher';
+      return isSignedIn() && requesterUser().role == 'teacher' && requesterUser().status == 'active';
     }
 
-    function isStudent() {
-      return isSignedIn() && getUserData(request.auth.uid).role == 'student';
-    }
-
-    function isValidId(id) {
-      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
-    }
-
-    // User Profiles
+    // -------------------------
+    // users collection (Step 5-4 initial rules)
+    // -------------------------
     match /users/{userId} {
-      function isValidUser(data) {
-        return data.keys().hasAll(['uid', 'email', 'role', 'createdAt']) &&
-               data.uid == request.auth.uid &&
-               data.role in ['teacher', 'student'] &&
-               data.createdAt == request.time;
+      // Meaning: validation used when users/{uid} is created for the first time.
+      function validUserCreate() {
+        return request.resource.data.uid == request.auth.uid &&
+               request.resource.data.uid == userId &&
+               request.resource.data.email is string &&
+               request.resource.data.email == lower(request.resource.data.email) &&
+               request.resource.data.role in ['teacher', 'student'] &&
+               request.resource.data.status == 'active' &&
+               request.resource.data.createdAt is timestamp &&
+               request.resource.data.updatedAt is timestamp &&
+               request.resource.data.lastLoginAt is timestamp;
       }
 
-      allow read: if isSignedIn(); // Teachers need to read student info, students might need teacher info
-      allow create: if isSignedIn() && request.auth.uid == userId && isValidUser(request.resource.data);
-      allow update: if isSignedIn() && request.auth.uid == userId && 
-                       request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName', 'email']) &&
-                       request.resource.data.role == resource.data.role; // Immutable role
-    }
-
-    // Writings
-    match /writings/{writingId} {
-      function isValidWriting(data) {
-        return data.keys().hasAll(['title', 'content', 'authorId', 'createdAt']) &&
-               data.title is string && data.title.size() <= 500 &&
-               data.content is string && data.content.size() <= 50000 &&
-               data.authorId == request.auth.uid &&
-               data.createdAt == request.time;
+      // Meaning: users can update only safe profile/login fields for themselves.
+      // role/status/createdAt cannot be changed by client-side users.
+      function validUserUpdate() {
+        return request.resource.data.uid == resource.data.uid &&
+               request.resource.data.uid == request.auth.uid &&
+               request.resource.data.role == resource.data.role &&
+               request.resource.data.status == resource.data.status &&
+               request.resource.data.createdAt == resource.data.createdAt &&
+               request.resource.data.email is string &&
+               request.resource.data.email == lower(request.resource.data.email) &&
+               request.resource.data.updatedAt is timestamp &&
+               request.resource.data.lastLoginAt is timestamp;
       }
 
-      allow read: if isSignedIn() && (isOwner(resource.data.authorId) || isTeacher());
-      allow list: if isSignedIn() && (isOwner(resource.data.authorId) || isTeacher());
-      allow create: if isSignedIn() && isValidWriting(request.resource.data);
-      allow update: if isSignedIn() && isValidId(writingId) && (isOwner(resource.data.authorId) || isTeacher());
-      allow delete: if isSignedIn() && isValidId(writingId) && isOwner(resource.data.authorId);
+      // Not logged in -> denied by condition.
+      // Logged in user can read own doc.
+      // Teacher can read all users docs.
+      allow get: if isSignedIn() && (isSelf(userId) || isTeacher());
+
+      // list/query of users is teacher-only.
+      allow list: if isSignedIn() && isTeacher();
+
+      // First-time creation: self only with strict shape.
+      allow create: if isSelf(userId) && validUserCreate();
+
+      // Update: self only and no role/status tampering.
+      allow update: if isSelf(userId) && validUserUpdate();
+
+      // Delete is blocked for now (safer default for account records).
+      allow delete: if false;
     }
 
-    // Quizzes
-    match /quizzes/{quizId} {
-      function isValidQuiz(data) {
-        return data.keys().hasAll(['topic', 'level', 'questions', 'authorId', 'createdAt']) &&
-               isTeacher() &&
-               data.authorId == request.auth.uid &&
-               data.createdAt == request.time;
+
+    // -------------------------
+    // students collection (Phase 5-1 initial rules)
+    // -------------------------
+    match /students/{studentId} {
+      // Teacher can read all student docs.
+      function canTeacherReadStudent() {
+        return isTeacher();
       }
 
-      allow read: if isSignedIn();
-      allow list: if isSignedIn();
-      allow create: if isTeacher() && isValidQuiz(request.resource.data);
-      allow update, delete: if isTeacher() && isOwner(resource.data.authorId);
-    }
-
-    // Articles
-    match /articles/{articleId} {
-      function isValidArticle(data) {
-        return data.keys().hasAll(['rewrittenText', 'level', 'authorId', 'createdAt']) &&
-               isTeacher() &&
-               data.authorId == request.auth.uid &&
-               data.createdAt == request.time;
+      // Student can read only own student document.
+      // Supports matching by uid OR lowercase email.
+      function canStudentReadOwnStudentDoc() {
+        return isSignedIn() && (
+          resource.data.uid == request.auth.uid ||
+          resource.data.email == lower(request.auth.token.email)
+        );
       }
 
-      allow read: if isSignedIn();
-      allow list: if isSignedIn();
-      allow create: if isTeacher() && isValidArticle(request.resource.data);
-      allow update, delete: if isTeacher() && isOwner(resource.data.authorId);
+      allow get: if canTeacherReadStudent() || canStudentReadOwnStudentDoc();
+      allow list: if canTeacherReadStudent();
+
+      // Create/update/delete are blocked in this phase.
+      allow create, update, delete: if false;
     }
 
-    // Connection testing
-    match /test/{docId} {
-      allow read: if true;
+    // -------------------------------------------------
+    // Temporary placeholders for other collections
+    // (will be replaced in later steps)
+    // -------------------------------------------------
+    match /{document=**} {
+      allow read, write: if false;
     }
   }
 }

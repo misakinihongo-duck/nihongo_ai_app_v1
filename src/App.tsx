@@ -4,6 +4,9 @@
  */
 
 import React, { useState, useEffect, useMemo } from 'react';
+import { GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut } from 'firebase/auth';
+import { collection, doc, getDoc, getDocs, query, serverTimestamp, setDoc, where } from 'firebase/firestore';
+import { auth, db } from './firebase';
 import { GoogleGenAI, Type } from "@google/genai";
 import { 
   BookOpen, 
@@ -36,7 +39,6 @@ import {
   ChevronDown,
   Camera,
   ImagePlus,
-  Mail,
   User as UserIcon
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
@@ -406,6 +408,22 @@ Output ONLY the article title and content. Do not include any introductory remar
 };
 
 // --- Gemini Service ---
+
+const ALLOWED_EMAIL_ROLE_MAP: Record<string, 'teacher' | 'student'> = {
+  'misaki.nihongo@gmail.com': 'teacher',
+  'tudorpetrutmihai@gmail.com': 'student',
+  'chris.long.00@gmail.com': 'student',
+  'andreu.eric@gmail.com': 'student',
+  'jacklahti09@gmail.com': 'student',
+  'aspikchan@gmail.com': 'student',
+};
+
+const getAllowedRoleByEmail = (email?: string | null): 'teacher' | 'student' | null => {
+  if (!email) return null;
+  const normalizedEmail = email.toLowerCase().trim();
+  return ALLOWED_EMAIL_ROLE_MAP[normalizedEmail] || null;
+};
+
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
 
 const geminiModel = "gemini-3-flash-preview";
@@ -2860,7 +2878,104 @@ const compressImage = (file: File): Promise<string> => {
   };
 
 
+
+const upsertUserDocument = async ({
+  uid,
+  email,
+  displayName,
+  role,
+}: {
+  uid: string;
+  email: string;
+  displayName: string;
+  role: 'teacher' | 'student';
+}) => {
+  const userRef = doc(db, 'users', uid);
+  const snapshot = await getDoc(userRef);
+
+  // TODO(firebase-migration): move allow-list + role assignment to trusted backend (Functions).
+  if (!snapshot.exists()) {
+    await setDoc(userRef, {
+      uid,
+      email,
+      displayName,
+      role,
+      status: 'active',
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+      lastLoginAt: serverTimestamp(),
+    });
+    return;
+  }
+
+  await setDoc(
+    userRef,
+    {
+      uid,
+      email,
+      displayName,
+      role,
+      status: 'active',
+      updatedAt: serverTimestamp(),
+      lastLoginAt: serverTimestamp(),
+    },
+    { merge: true }
+  );
+};
+
+
+const fetchStudentsFromFirestore = async (params: {
+  uid: string;
+  email: string;
+  role: 'teacher' | 'student';
+}): Promise<Student[]> => {
+  const studentsRef = collection(db, 'students');
+
+  if (params.role === 'teacher') {
+    const q = query(studentsRef, where('role', '==', 'student'));
+    const snap = await getDocs(q);
+    return snap.docs.map((d) => {
+      const data = d.data() as any;
+      return {
+        email: (data.email || '').toLowerCase(),
+        name: data.name || data.displayName || data.email || '',
+        role: 'student',
+      } as Student;
+    });
+  }
+
+  // Student can fetch only own student profile.
+  // IMPORTANT: use getDoc (not list/query) so this works with strict rules (student has no list permission).
+  const normalizedEmail = params.email.toLowerCase().trim();
+
+  const byUidRef = doc(db, 'students', params.uid);
+  const byUidSnap = await getDoc(byUidRef);
+  if (byUidSnap.exists()) {
+    const data = byUidSnap.data() as any;
+    return [{
+      email: (data.email || normalizedEmail).toLowerCase(),
+      name: data.name || data.displayName || normalizedEmail,
+      role: 'student',
+    }];
+  }
+
+  // Fallback pattern for transitional data where docId may be email.
+  const byEmailRef = doc(db, 'students', normalizedEmail);
+  const byEmailSnap = await getDoc(byEmailRef);
+  if (byEmailSnap.exists()) {
+    const data = byEmailSnap.data() as any;
+    return [{
+      email: (data.email || normalizedEmail).toLowerCase(),
+      name: data.name || data.displayName || normalizedEmail,
+      role: 'student',
+    }];
+  }
+
+  return [];
+};
+
 interface SimpleUser {
+  uid: string;
   email: string;
   displayName: string;
   photoURL?: string;
@@ -2877,42 +2992,120 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [language, setLanguage] = useState<Language>('ja');
-  const [loginEmail, setLoginEmail] = useState('');
 
   // Teacher-specific state
   const [students, setStudents] = useState<Student[]>([]);
   const [selectedStudentEmail, setSelectedStudentEmail] = useState<string | null>(null);
 
-  // Auth Integration with SQLite Users
+  // Auth Integration (Step 5-1): Firebase Google Sign-In + existing SQLite profile bridge
   useEffect(() => {
-    const savedUser = localStorage.getItem('nihongo_session');
-    if (savedUser) {
-      const u = JSON.parse(savedUser);
-      loadUserProfile(u.email);
-    } else {
-      setLoading(false);
-    }
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (!firebaseUser || !firebaseUser.email) {
+        setUser(null);
+        setUserProfile(null);
+        setLoading(false);
+        return;
+      }
+
+      const normalizedEmail = firebaseUser.email.toLowerCase().trim();
+      const allowedRole = getAllowedRoleByEmail(normalizedEmail);
+
+      // TODO(firebase-migration): Move allow-list checks to Firestore `allowed_users` or Cloud Functions.
+      if (!allowedRole) {
+        setError(language === 'ja' ? 'このアカウントにはアクセス権がありません。' : 'This account does not have access.');
+        await signOut(auth);
+        setLoading(false);
+        return;
+      }
+
+      const simpleUser = {
+        uid: firebaseUser.uid,
+        email: normalizedEmail,
+        displayName: firebaseUser.displayName || normalizedEmail,
+        photoURL: firebaseUser.photoURL || undefined,
+      };
+
+      await upsertUserDocument({
+        uid: simpleUser.uid,
+        email: simpleUser.email,
+        displayName: simpleUser.displayName,
+        role: allowedRole,
+      });
+
+      setUser(simpleUser as any);
+
+      // TODO(firebase-migration): Replace /api/user/:email dependency with Firestore users/{uid} lookup.
+      // For Step 5-3, we still use backend profile sync while keeping Firestore users/{uid} in sync.
+      await loadUserProfile(normalizedEmail, allowedRole);
+    });
+
+    return () => unsubscribe();
   }, []);
 
-  const loadUserProfile = async (email: string) => {
+  const loadUserProfile = async (email: string, fallbackRole?: 'teacher' | 'student') => {
     setLoading(true);
     try {
-      const res = await fetch(`/api/user/${email.toLowerCase().trim()}`);
+      const normalizedEmail = email.toLowerCase().trim();
+      const res = await fetch(`/api/user/${normalizedEmail}`);
       if (res.ok) {
         const profile = await res.json();
-        setUserProfile(profile);
-        const simpleUser = { email: profile.email, displayName: profile.name };
+        setUserProfile({ ...profile, email: normalizedEmail, role: profile.role || fallbackRole } as UserProfile);
+        const simpleUser = { uid: profile.uid || profile.email, email: normalizedEmail, displayName: profile.name };
         setUser(simpleUser);
         localStorage.setItem('nihongo_session', JSON.stringify(simpleUser));
         
-        if (profile.role === 'teacher') {
-          const sRes = await fetch('/api/students');
-          if (sRes.ok) setStudents(await sRes.json());
+        const normalizedRole = (profile.role || fallbackRole) as 'teacher' | 'student';
+
+        try {
+          const firestoreStudents = await fetchStudentsFromFirestore({
+            uid: simpleUser.uid,
+            email: normalizedEmail,
+            role: normalizedRole,
+          });
+          setStudents(firestoreStudents);
+        } catch (firestoreErr) {
+          // TODO(firebase-migration): remove fallback once students collection is fully populated.
+          if (normalizedRole === 'teacher') {
+            const sRes = await fetch('/api/students');
+            if (sRes.ok) setStudents(await sRes.json());
+          }
+        }
+
+        if (normalizedRole === 'teacher') {
           setCurrentView('dashboard');
         } else {
           setSelectedStudentEmail(profile.email);
           setCurrentView('dashboard');
         }
+        setError(null);
+      } else if (fallbackRole) {
+        // Temporary fallback while `/api/user/:email` still exists; allows role derivation from allow-list.
+        const fallbackUid = user?.uid || normalizedEmail;
+        setUserProfile({
+          uid: fallbackUid,
+          email: normalizedEmail,
+          displayName: user?.displayName || normalizedEmail,
+          role: fallbackRole,
+        });
+
+        try {
+          const firestoreStudents = await fetchStudentsFromFirestore({
+            uid: fallbackUid,
+            email: normalizedEmail,
+            role: fallbackRole,
+          });
+          setStudents(firestoreStudents);
+        } catch (firestoreErr) {
+          if (fallbackRole === 'teacher') {
+            const sRes = await fetch('/api/students');
+            if (sRes.ok) setStudents(await sRes.json());
+          }
+        }
+
+        if (fallbackRole === 'student') {
+          setSelectedStudentEmail(normalizedEmail);
+        }
+        setCurrentView('dashboard');
         setError(null);
       } else {
         setError(language === 'ja' ? "登録されていないメールアドレスです。" : "Email not found in our records.");
@@ -2927,17 +3120,28 @@ export default function App() {
 
   const handleLogin = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (!loginEmail) return;
     setIsProcessing(true);
-    await loadUserProfile(loginEmail.toLowerCase().trim());
-    setIsProcessing(false);
+    setError(null);
+    try {
+      const provider = new GoogleAuthProvider();
+      await signInWithPopup(auth, provider);
+    } catch (err) {
+      console.error('Google sign-in failed:', err);
+      setError(language === 'ja' ? 'Googleログインに失敗しました。' : 'Google sign-in failed.');
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
-  const handleLogout = () => {
-    setUser(null);
-    setUserProfile(null);
-    localStorage.removeItem('nihongo_session');
-    setCurrentView('dashboard');
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+    } finally {
+      setUser(null);
+      setUserProfile(null);
+      localStorage.removeItem('nihongo_session');
+      setCurrentView('dashboard');
+    }
   };
 
   // Fetch Writings & Articles
@@ -3045,23 +3249,13 @@ export default function App() {
             <p className="text-[#8C7A6B] text-lg font-medium">{t.login.desc}</p>
           </div>
           
-          <form onSubmit={handleLogin} className="space-y-4 text-left">
-            <div className="space-y-2">
-              <label className="text-[10px] font-bold text-[#8C7A6B] uppercase tracking-widest ml-1">Email Address</label>
-              <div className="relative">
-                <Mail className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-[#8C7A6B]" />
-                <input 
-                  type="email" 
-                  placeholder="your@email.com"
-                  required
-                  className="w-full pl-12 pr-4 py-4 bg-[#FDFBF7] border-2 border-[#F3E8E0] rounded-3xl outline-none focus:border-[#D97736] transition-all text-[#4A3F35] font-medium"
-                  value={loginEmail}
-                  onChange={e => setLoginEmail(e.target.value)}
-                />
-              </div>
-            </div>
+          <div className="space-y-4">
+            <Button className="w-full py-5 text-xl rounded-3xl shadow-lg shadow-[#D97736]/20" onClick={handleLogin} isLoading={isProcessing}>
+              <Globe className="w-5 h-5" />
+              {t.login.btn}
+            </Button>
             {error && (
-              <motion.div 
+              <motion.div
                 initial={{ opacity: 0, y: -10 }}
                 animate={{ opacity: 1, y: 0 }}
                 className="flex items-center gap-2 p-3 bg-red-50 text-red-600 rounded-2xl text-sm font-medium border border-red-100"
@@ -3070,10 +3264,7 @@ export default function App() {
                 {error}
               </motion.div>
             )}
-            <Button className="w-full py-5 text-xl rounded-3xl shadow-lg shadow-[#D97736]/20" onClick={handleLogin} isLoading={isProcessing}>
-              {language === 'ja' ? 'ログイン' : 'Login'}
-            </Button>
-          </form>
+          </div>
 
           <p className="text-xs text-[#8C7A6B] leading-relaxed px-4">{t.login.tos}</p>
         </Card>
