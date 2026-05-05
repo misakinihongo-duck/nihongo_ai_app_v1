@@ -416,12 +416,19 @@ const ALLOWED_EMAIL_ROLE_MAP: Record<string, 'teacher' | 'student'> = {
   'andreu.eric@gmail.com': 'student',
   'jacklahti09@gmail.com': 'student',
   'aspikchan@gmail.com': 'student',
+  'mtokuyama23@gmail.com': 'student',
 };
 
 const getAllowedRoleByEmail = (email?: string | null): 'teacher' | 'student' | null => {
   if (!email) return null;
   const normalizedEmail = email.toLowerCase().trim();
   return ALLOWED_EMAIL_ROLE_MAP[normalizedEmail] || null;
+};
+
+
+const isTestStudentEmail = (email?: string | null): boolean => {
+  if (!email) return false;
+  return email.toLowerCase().trim() === 'mtokuyama23@gmail.com';
 };
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
@@ -2884,11 +2891,13 @@ const upsertUserDocument = async ({
   email,
   displayName,
   role,
+  isTestUser,
 }: {
   uid: string;
   email: string;
   displayName: string;
   role: 'teacher' | 'student';
+  isTestUser: boolean;
 }) => {
   const userRef = doc(db, 'users', uid);
   const snapshot = await getDoc(userRef);
@@ -2901,6 +2910,7 @@ const upsertUserDocument = async ({
       displayName,
       role,
       status: 'active',
+      isTestUser,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
       lastLoginAt: serverTimestamp(),
@@ -2916,6 +2926,7 @@ const upsertUserDocument = async ({
       displayName,
       role,
       status: 'active',
+      isTestUser,
       updatedAt: serverTimestamp(),
       lastLoginAt: serverTimestamp(),
     },
@@ -3030,6 +3041,7 @@ export default function App() {
         email: simpleUser.email,
         displayName: simpleUser.displayName,
         role: allowedRole,
+        isTestUser: isTestStudentEmail(normalizedEmail),
       });
 
       setUser(simpleUser as any);

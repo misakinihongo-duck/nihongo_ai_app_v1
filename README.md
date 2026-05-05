@@ -107,3 +107,50 @@ If using Firebase CLI:
 npx firebase deploy --only firestore:rules
 npx firebase deploy --only hosting
 ```
+
+
+## Test student account (for development verification)
+
+To verify student UI/permissions without using real student accounts, this repo temporarily allows:
+
+- `mtokuyama23@gmail.com` (student)
+
+### Firestore data examples
+
+`users/{uid}` (created/updated on login):
+
+```json
+{
+  "uid": "<firebase-auth-uid>",
+  "email": "mtokuyama23@gmail.com",
+  "displayName": "Test Student",
+  "role": "student",
+  "status": "active",
+  "isTestUser": true,
+  "createdAt": "<serverTimestamp>",
+  "updatedAt": "<serverTimestamp>",
+  "lastLoginAt": "<serverTimestamp>"
+}
+```
+
+`students/{uid}` (recommended; transitional `students/{email}` also supported by current app):
+
+```json
+{
+  "uid": "<firebase-auth-uid>",
+  "email": "mtokuyama23@gmail.com",
+  "name": "Test Student",
+  "role": "student",
+  "status": "active",
+  "isTestUser": true
+}
+```
+
+### Before production deploy
+
+Disable or remove this test user:
+
+1. Remove `mtokuyama23@gmail.com` from app allow-list in `src/App.tsx`.
+2. In Firestore `users/{uid}`, set `status` to `disabled` **or** delete the document.
+3. Delete corresponding `students/{uid}` (or transitional `students/{email}`) test record.
+4. Re-test login to confirm access is blocked for the test account.
