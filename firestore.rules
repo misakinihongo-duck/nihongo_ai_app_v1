@@ -99,6 +99,73 @@ service cloud.firestore {
       allow create, update, delete: if false;
     }
 
+
+    // -------------------------
+    // Core learning data collections (Phase 5)
+    // -------------------------
+    function isStudentOwner(data) {
+      return isSignedIn() && data.ownerUid == request.auth.uid;
+    }
+
+    function canReadCoreData(data) {
+      return isTeacher() || isStudentOwner(data);
+    }
+
+    function hasRequiredCoreCreateFields(data) {
+      return data.keys().hasAll([
+        'ownerUid',
+        'ownerEmail',
+        'studentId',
+        'teacherUid',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.ownerUid is string &&
+      data.ownerEmail is string &&
+      data.studentId is string &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function validCoreCreate(data) {
+      return hasRequiredCoreCreateFields(data) &&
+             (isTeacher() || (
+               data.ownerUid == request.auth.uid &&
+               data.ownerEmail == lower(request.auth.token.email)
+             ));
+    }
+
+    function validCoreUpdate() {
+      return request.resource.data.ownerUid == resource.data.ownerUid &&
+             request.resource.data.ownerEmail == resource.data.ownerEmail &&
+             request.resource.data.studentId == resource.data.studentId &&
+             request.resource.data.teacherUid == resource.data.teacherUid &&
+             request.resource.data.createdAt == resource.data.createdAt &&
+             request.resource.data.updatedAt is timestamp &&
+             canReadCoreData(resource.data);
+    }
+
+    match /essays/{essayId} {
+      allow get, list: if canReadCoreData(resource.data);
+      allow create: if isSignedIn() && validCoreCreate(request.resource.data);
+      allow update: if isSignedIn() && validCoreUpdate();
+      allow delete: if isSignedIn() && canReadCoreData(resource.data);
+    }
+
+    match /vocab/{vocabId} {
+      allow get, list: if canReadCoreData(resource.data);
+      allow create: if isSignedIn() && validCoreCreate(request.resource.data);
+      allow update: if isSignedIn() && validCoreUpdate();
+      allow delete: if isSignedIn() && canReadCoreData(resource.data);
+    }
+
+    match /articles/{articleId} {
+      allow get, list: if canReadCoreData(resource.data);
+      allow create: if isSignedIn() && validCoreCreate(request.resource.data);
+      allow update: if isSignedIn() && validCoreUpdate();
+      allow delete: if isSignedIn() && canReadCoreData(resource.data);
+    }
+
     // -------------------------------------------------
     // Temporary placeholders for other collections
     // (will be replaced in later steps)

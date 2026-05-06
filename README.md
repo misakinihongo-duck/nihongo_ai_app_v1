@@ -154,3 +154,57 @@ Disable or remove this test user:
 2. In Firestore `users/{uid}`, set `status` to `disabled` **or** delete the document.
 3. Delete corresponding `students/{uid}` (or transitional `students/{email}`) test record.
 4. Re-test login to confirm access is blocked for the test account.
+
+## Phase 5 verification: Firestore core data migration
+
+Phase 5 moves the main client-side data reads/writes away from the Express/SQLite API and into Firestore collections.
+The Express routes in `server.ts` are intentionally kept for now, but the React app should use Firestore for the migrated client flows.
+
+### Migrated client flows
+
+- `students`: loaded from Firestore `students`.
+- `essays`: created, read, updated, and deleted in Firestore `essays`.
+- `articles`: created, read, updated, and deleted in Firestore `articles`.
+- `vocab`: reserved as Firestore `vocab`; the current UI stores vocabulary lists inside essays/articles, and no client `/api/vocab` call should remain.
+
+### Required document ownership fields
+
+New `essays`, `articles`, and future `vocab` documents should include:
+
+```json
+{
+  "ownerUid": "<student-auth-uid>",
+  "ownerEmail": "student@example.com",
+  "studentId": "<student-auth-uid-or-student-id>",
+  "teacherUid": "<teacher-auth-uid-or-null>",
+  "createdAt": "<serverTimestamp>",
+  "updatedAt": "<serverTimestamp>"
+}
+```
+
+### Manual verification in Codespace
+
+1. Install and start the app:
+
+   ```bash
+   npm install
+   npm run dev
+   ```
+
+2. Login as the test student `mtokuyama23@gmail.com`.
+3. Create a writing in the writing workspace.
+4. Confirm Firestore has a new `essays` document with `ownerUid`, `ownerEmail`, `studentId`, `teacherUid`, `createdAt`, and `updatedAt`.
+5. Edit the writing and confirm `updatedAt` changes.
+6. Generate/save an article and confirm Firestore has a new `articles` document with the same ownership fields.
+7. Login as the teacher account and confirm teacher views can read student essays/articles.
+8. Confirm the React app no longer calls `/api/students`, `/api/essays`, `/api/vocab`, or `/api/articles` by running:
+
+   ```bash
+   rg -n "/api/students|/api/essays|/api/vocab|/api/articles" src/App.tsx
+   ```
+
+   Expected result: no matches.
+
+### Remaining backend note
+
+`server.ts` still contains the old Express/SQLite routes during the migration window. Do not delete it until Firebase Hosting/App Hosting/Functions strategy is finalized.
