@@ -4,20 +4,23 @@
  */
 
 import React, { useState, useEffect, useMemo } from 'react';
+import { GoogleAuthProvider, onAuthStateChanged, signInWithPopup, signOut } from 'firebase/auth';
+import { addDoc, collection, deleteDoc, doc, getDoc, getDocs, orderBy, query, serverTimestamp, setDoc, updateDoc, where } from 'firebase/firestore';
+import { auth, db } from './firebase';
 import { GoogleGenAI, Type } from "@google/genai";
-import { 
-  BookOpen, 
-  PenTool, 
-  HelpCircle, 
-  FileText, 
-  LogOut, 
-  Plus, 
-  ChevronRight, 
-  Trash2, 
-  Save, 
-  Eye, 
-  Edit3, 
-  Languages, 
+import {
+  BookOpen,
+  PenTool,
+  HelpCircle,
+  FileText,
+  LogOut,
+  Plus,
+  ChevronRight,
+  Trash2,
+  Save,
+  Eye,
+  Edit3,
+  Languages,
   CheckCircle2,
   AlertCircle,
   Loader2,
@@ -36,13 +39,13 @@ import {
   ChevronDown,
   Camera,
   ImagePlus,
-  Mail,
   User as UserIcon
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import Markdown from 'react-markdown';
 import { diff_match_patch } from 'diff-match-patch';
 import { cn } from './lib/utils';
+import { DEV_PREVIEW_STUDENTS, DevPreviewMode, getDevPreviewUser, isDevPreviewAvailable } from './devPreview';
 
 // --- Types ---
 enum OperationType {
@@ -60,6 +63,7 @@ interface Writing {
   content: string;
   originalContent?: string;
   correctedContent?: string;
+  feedback?: string;
   furiganaContent?: string;
   images?: string[];
   vocabularyList?: { word: string; reading: string; meaning: string; example?: string }[];
@@ -102,6 +106,7 @@ interface UserProfile {
 }
 
 interface Student {
+  uid?: string;
   email: string;
   name: string;
   role: 'student';
@@ -385,9 +390,9 @@ Markdown記号（#や**など）は一切使用しないでください。改行
       vocabMeaning: "Meaning",
       addBtn: "Add",
       furiganaBtn: "Furigana",
-      genPrompt: (topic: string, level: string) => `Write an interesting Japanese article about "${topic}" for JLPT ${level} learners (approx. 400-500 characters). 
+      genPrompt: (topic: string, level: string) => `Write an interesting Japanese article about "${topic}" for JLPT ${level} learners (approx. 400-500 characters).
 Include a concise title (max 20 chars) on the very first line.
-Do NOT use Markdown symbols like #, **, or *. Use only plain text and line breaks for readability. 
+Do NOT use Markdown symbols like #, **, or *. Use only plain text and line breaks for readability.
 Output ONLY the article title and content. Do not include any introductory remarks like "Here is the article".`,
     },
     login: {
@@ -406,24 +411,47 @@ Output ONLY the article title and content. Do not include any introductory remar
 };
 
 // --- Gemini Service ---
+
+const ALLOWED_EMAIL_ROLE_MAP: Record<string, 'teacher' | 'student'> = {
+  'misaki.nihongo@gmail.com': 'teacher',
+  'tudorpetrutmihai@gmail.com': 'student',
+  'chris.long.00@gmail.com': 'student',
+  'andreu.eric@gmail.com': 'student',
+  'jacklahti09@gmail.com': 'student',
+  'aspikchan@gmail.com': 'student',
+  'mtokuyama23@gmail.com': 'student',
+};
+
+const getAllowedRoleByEmail = (email?: string | null): 'teacher' | 'student' | null => {
+  if (!email) return null;
+  const normalizedEmail = email.toLowerCase().trim();
+  return ALLOWED_EMAIL_ROLE_MAP[normalizedEmail] || null;
+};
+
+
+const isTestStudentEmail = (email?: string | null): boolean => {
+  if (!email) return false;
+  return email.toLowerCase().trim() === 'mtokuyama23@gmail.com';
+};
+
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
 
 const geminiModel = "gemini-3-flash-preview";
 
 // --- Components ---
 
-const Button = ({ 
-  children, 
-  onClick, 
-  variant = 'primary', 
+const Button = ({
+  children,
+  onClick,
+  variant = 'primary',
   size = 'md',
-  className, 
-  disabled, 
-  isLoading 
-}: { 
-  children: React.ReactNode; 
-  onClick?: (e?: any) => void; 
-  variant?: 'primary' | 'secondary' | 'outline' | 'danger' | 'ghost' | 'soft'; 
+  className,
+  disabled,
+  isLoading
+}: {
+  children: React.ReactNode;
+  onClick?: (e?: any) => void;
+  variant?: 'primary' | 'secondary' | 'outline' | 'danger' | 'ghost' | 'soft';
   size?: 'sm' | 'md' | 'lg';
   className?: string;
   disabled?: boolean;
@@ -461,13 +489,39 @@ const Button = ({
 };
 
 const Card = ({ children, className, onClick }: { children: React.ReactNode; className?: string; onClick?: () => void }) => (
-  <div 
+  <div
     onClick={onClick}
     className={cn('bg-white rounded-[2rem] shadow-sm overflow-hidden', className)}
   >
     {children}
   </div>
 );
+
+
+const DevPreviewPanel = ({ mode, onChange }: { mode: DevPreviewMode; onChange: (mode: DevPreviewMode) => void }) => {
+  if (!isDevPreviewAvailable) return null;
+
+  return (
+    <div className="fixed bottom-4 right-4 z-[80] w-[280px] rounded-3xl border border-amber-200 bg-amber-50/95 p-4 text-[#4A3F35] shadow-2xl backdrop-blur">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="text-[10px] font-extrabold uppercase tracking-widest text-amber-700">Dev Preview Panel</p>
+          <p className="mt-1 text-xs text-amber-800">UI preview only. Firestore writes are disabled in preview.</p>
+        </div>
+        {mode !== 'off' && <span className="rounded-full bg-amber-200 px-2 py-0.5 text-[10px] font-bold text-amber-900">PREVIEW</span>}
+      </div>
+      <select
+        className="mt-3 w-full rounded-2xl border border-amber-200 bg-white px-3 py-2 text-sm font-semibold outline-none focus:ring-2 focus:ring-amber-400"
+        value={mode}
+        onChange={(event) => onChange(event.target.value as DevPreviewMode)}
+      >
+        <option value="off">Off / Real Auth</option>
+        <option value="teacher">Teacher Preview / Misaki</option>
+        <option value="student">Student Preview / Test Student</option>
+      </select>
+    </div>
+  );
+};
 
 const Badge = ({ children, color = 'orange', className }: { children: React.ReactNode; color?: string; className?: string }) => {
   const colors: Record<string, string> = {
@@ -534,12 +588,12 @@ const compressImage = (file: File): Promise<string> => {
             <h1 className="text-3xl font-bold text-[#4A3F35]">{t.dashboard.greeting(user?.displayName)}</h1>
             <p className="text-[#8C7A6B]">{t.dashboard.subGreeting(userProfile?.role)}</p>
           </div>
-          
+
           <div className="flex items-center gap-3">
             {isTeacher && (
               <div className="flex items-center gap-2 bg-[#FFF8F3] border border-[#F3E8E0] px-3 py-1.5 rounded-full">
                 <span className="text-xs font-bold text-[#8C7A6B]">担当生徒:</span>
-                <select 
+                <select
                   className="text-sm font-medium bg-transparent border-none outline-none focus:ring-0 text-[#4A3F35]"
                   value={selectedStudentEmail || ""}
                   onChange={(e) => setSelectedStudentEmail(e.target.value)}
@@ -605,7 +659,7 @@ const compressImage = (file: File): Promise<string> => {
     );
   };
 
-  const WritingWorkspace = ({ user, userProfile, writings, setWritings, selectedWriting, setSelectedWriting, isProcessing, setIsProcessing, lang }: any) => {
+  const WritingWorkspace = ({ user, userProfile, writings, setWritings, selectedWriting, setSelectedWriting, isProcessing, setIsProcessing, lang, students, isPreviewMode }: any) => {
     const t = TRANSLATIONS[lang as Language];
     const isTeacher = userProfile?.role === 'teacher';
   const generateFurigana = async (text: string, onChunk: (chunk: string) => void) => {
@@ -649,7 +703,7 @@ const compressImage = (file: File): Promise<string> => {
     const [isAsking, setIsAsking] = useState(false);
     const [showFurigana, setShowFurigana] = useState(false);
     const [streamingFurigana, setStreamingFurigana] = useState<string | null>(null);
-    
+
     // New UI states
     const [isLeftSidebarOpen, setIsLeftSidebarOpen] = useState(true);
     const [isRightSidebarOpen, setIsRightSidebarOpen] = useState(true);
@@ -666,11 +720,11 @@ const compressImage = (file: File): Promise<string> => {
       if (!selectedWriting || !selectedWriting.originalContent || selectedWriting.originalContent === selectedWriting.content) return null;
       const d = dmp.diff_main(selectedWriting.originalContent, selectedWriting.content);
       dmp.diff_cleanupSemantic(d);
-      
+
       return d.map((part, index) => {
         const type = part[0];
         const text = part[1];
-        
+
         if (type === 1) { // INSERT
           return <span key={index} className="bg-[#e6ffe6] text-green-800 underline decoration-green-500">{text}</span>;
         } else if (type === -1) { // DELETE
@@ -694,30 +748,21 @@ const compressImage = (file: File): Promise<string> => {
       if (!newTitle || !newContent || !user) return;
       setIsAdding(true);
       try {
-        const res = await fetch('/api/essays', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            student_email: user.email,
-            title: newTitle,
-            content: newContent
-          })
-        });
-        if (res.ok) {
-          const { id } = await res.json();
-          setNewTitle('');
-          setNewContent('');
-          // Local update or wait for re-fetch
-          const newWriting = { 
-            id: id.toString(), 
-            title: newTitle, 
-            content: newContent, 
-            authorId: user.email, 
-            createdAt: { toDate: () => new Date() } 
-          } as Writing;
-          setSelectedWriting(newWriting);
-          setWritings([newWriting, ...writings]);
-        }
+        const id = await createEssayInFirestore(
+          { currentUser: user, userProfile, students, isPreviewMode },
+          { title: newTitle, content: newContent }
+        );
+        setNewTitle('');
+        setNewContent('');
+        const newWriting = {
+          id,
+          title: newTitle,
+          content: newContent,
+          authorId: user.email,
+          createdAt: { toDate: () => new Date() }
+        } as Writing;
+        setSelectedWriting(newWriting);
+        setWritings([newWriting, ...writings]);
       } catch (err) {
         console.error("Save failed", err);
       } finally {
@@ -732,21 +777,15 @@ const compressImage = (file: File): Promise<string> => {
         const payload: any = {
           title: editedTitle,
         };
-        
+
         if (isTeacher) {
           payload.correction = editedContent;
           payload.feedback = selectedWriting.feedback;
         } else {
           payload.content = editedContent;
         }
-
-        const res = await fetch(`/api/essays/${selectedWriting.id}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-        
-        if (res.ok) {
+        await updateEssayInFirestore(selectedWriting.id, payload, isPreviewMode);
+        {
           let updatedWriting;
           if (isTeacher) {
             updatedWriting = { ...selectedWriting, title: editedTitle, correctedContent: editedContent };
@@ -770,25 +809,21 @@ const compressImage = (file: File): Promise<string> => {
         setShowFurigana(true);
         return;
       }
-      
+
       setShowFurigana(true);
       setStreamingFurigana("");
-      
+
       const furigana = await generateFurigana(editedContent, (chunk) => {
         setStreamingFurigana(chunk);
       });
-      
+
       try {
-        const res = await fetch(`/api/essays/${selectedWriting.id}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
+        await updateEssayInFirestore(selectedWriting.id, {
             title: editedTitle,
             content: editedContent,
             furigana_content: furigana
-          })
-        });
-        if (res.ok) {
+          }, isPreviewMode);
+        {
           const updated = { ...selectedWriting, content: editedContent, title: editedTitle, furiganaContent: furigana };
           setSelectedWriting(updated);
           setWritings(writings.map((w: any) => w.id === selectedWriting.id ? updated : w));
@@ -806,7 +841,7 @@ const compressImage = (file: File): Promise<string> => {
 
     const handleDeleteConfirm = async (w: Writing) => {
       try {
-        await fetch(`/api/essays/${w.id}`, { method: 'DELETE' });
+        await deleteEssayFromFirestore(w.id, isPreviewMode);
         setWritings(writings.filter(item => item.id !== w.id));
         if (selectedWriting?.id === w.id) setSelectedWriting(null);
         setWritingToDelete(null);
@@ -839,20 +874,20 @@ const compressImage = (file: File): Promise<string> => {
         if (sel && sel.rangeCount > 0 && sel.toString().trim() !== '') {
           const range = sel.getRangeAt(0);
           const frag = range.cloneContents();
-          
+
           // Helper div to extract text content
           const div = document.createElement('div');
           div.appendChild(frag);
-          
+
           // Remove all furigana (ruby text) elements so they don't get included in the selection string
           const rtElements = div.querySelectorAll('rt');
           rtElements.forEach(rt => rt.remove());
-          
+
           const rpElements = div.querySelectorAll('rp');
           rpElements.forEach(rp => rp.remove());
 
           const text = div.textContent?.trim() || '';
-          
+
           if (text) {
             setSelection(text);
             setPopupMode('menu');
@@ -899,13 +934,8 @@ const compressImage = (file: File): Promise<string> => {
         const newQa = { q: question, a: '', text: selection };
         const currentList = selectedWriting.qaList || [];
         const updatedList = [...currentList, newQa];
-        
-        const res = await fetch(`/api/essays/${selectedWriting.id}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ qa_list: updatedList })
-        });
-        if (res.ok) {
+        await updateEssayInFirestore(selectedWriting.id, { qa_list: updatedList }, isPreviewMode);
+        {
           const updated = { ...selectedWriting, qaList: updatedList };
           setSelectedWriting(updated);
           setWritings(writings.map((w: any) => w.id === selectedWriting.id ? updated : w));
@@ -927,7 +957,7 @@ const compressImage = (file: File): Promise<string> => {
         const response = await ai.models.generateContent({
           model: geminiModel,
           contents: `以下の選択されたテキストから、対象となる単語（ふりがなが含まれている場合はふりがなを除いた漢字のみ）、その「よみがな」、および「英語の意味」を抽出してJSON形式で出力してください。\n\n選択テキスト: ${selection}`,
-          config: { 
+          config: {
             responseMimeType: "application/json",
             responseSchema: {
               type: Type.OBJECT,
@@ -946,17 +976,13 @@ const compressImage = (file: File): Promise<string> => {
         if (Array.isArray(newVocab)) {
           newVocab = newVocab[0];
         }
-        
+
         const currentList = selectedWriting.vocabularyList || [];
         const updatedList = [...currentList, newVocab];
-        
+
         try {
-          const res = await fetch(`/api/essays/${selectedWriting.id}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ vocabulary_list: updatedList })
-          });
-          if (res.ok) {
+        await updateEssayInFirestore(selectedWriting.id, { vocabulary_list: updatedList }, isPreviewMode);
+        {
             const updated = { ...selectedWriting, vocabularyList: updatedList };
             setSelectedWriting(updated);
             setWritings(writings.map((w: any) => w.id === selectedWriting.id ? updated : w));
@@ -970,12 +996,8 @@ const compressImage = (file: File): Promise<string> => {
         const currentList = selectedWriting.vocabularyList || [];
         const updatedList = [...currentList, { word: selection, reading: '', meaning: '' }];
         try {
-          const res = await fetch(`/api/essays/${selectedWriting.id}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ vocabulary_list: updatedList })
-          });
-          if (res.ok) {
+        await updateEssayInFirestore(selectedWriting.id, { vocabulary_list: updatedList }, isPreviewMode);
+        {
             const updated = { ...selectedWriting, vocabularyList: updatedList };
             setSelectedWriting(updated);
             setWritings(writings.map((w: any) => w.id === selectedWriting.id ? updated : w));
@@ -993,12 +1015,8 @@ const compressImage = (file: File): Promise<string> => {
       if (!selectedWriting || !selectedWriting.vocabularyList) return;
       const newList = selectedWriting.vocabularyList.filter((_, idx) => idx !== index);
       try {
-        const res = await fetch(`/api/essays/${selectedWriting.id}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ vocabulary_list: newList })
-        });
-        if (res.ok) {
+        await updateEssayInFirestore(selectedWriting.id, { vocabulary_list: newList }, isPreviewMode);
+        {
           const updated = { ...selectedWriting, vocabularyList: newList };
           setSelectedWriting(updated);
           setWritings(writings.map((w: any) => w.id === selectedWriting.id ? updated : w));
@@ -1018,11 +1036,7 @@ const compressImage = (file: File): Promise<string> => {
     const handleSaveVocabularyList = async () => {
       if (!selectedWriting || !selectedWriting.vocabularyList) return;
       try {
-        await fetch(`/api/essays/${selectedWriting.id}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ vocabulary_list: selectedWriting.vocabularyList })
-        });
+        await updateEssayInFirestore(selectedWriting.id, { vocabulary_list: selectedWriting.vocabularyList }, isPreviewMode);
         setWritings(writings.map((w: any) => w.id === selectedWriting.id ? selectedWriting : w));
       } catch (err) {
         console.error("Vocab update failed", err);
@@ -1039,11 +1053,7 @@ const compressImage = (file: File): Promise<string> => {
     const handleSaveQaList = async () => {
       if (!selectedWriting || !selectedWriting.qaList) return;
       try {
-        await fetch(`/api/essays/${selectedWriting.id}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ qa_list: selectedWriting.qaList })
-        });
+        await updateEssayInFirestore(selectedWriting.id, { qa_list: selectedWriting.qaList }, isPreviewMode);
         setWritings(writings.map((w: any) => w.id === selectedWriting.id ? selectedWriting : w));
       } catch (err) {
         console.error("QA update failed", err);
@@ -1054,11 +1064,7 @@ const compressImage = (file: File): Promise<string> => {
       if (!selectedWriting || !selectedWriting.qaList) return;
       const newList = selectedWriting.qaList.filter((_, idx) => idx !== index);
       try {
-        await fetch(`/api/essays/${selectedWriting.id}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ qa_list: newList })
-        });
+        await updateEssayInFirestore(selectedWriting.id, { qa_list: newList }, isPreviewMode);
         const updated = { ...selectedWriting, qaList: newList };
         setSelectedWriting(updated);
         setWritings(writings.map((w: any) => w.id === selectedWriting.id ? updated : w));
@@ -1073,12 +1079,8 @@ const compressImage = (file: File): Promise<string> => {
       const currentList = selectedWriting.vocabularyList || [];
       const updatedList = [...currentList, newVocab];
       try {
-        const res = await fetch(`/api/essays/${selectedWriting.id}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ vocabulary_list: updatedList })
-        });
-        if (res.ok) {
+        await updateEssayInFirestore(selectedWriting.id, { vocabulary_list: updatedList }, isPreviewMode);
+        {
           const updated = { ...selectedWriting, vocabularyList: updatedList };
           setSelectedWriting(updated);
           setWritings(writings.map((w: any) => w.id === selectedWriting.id ? updated : w));
@@ -1115,13 +1117,9 @@ const compressImage = (file: File): Promise<string> => {
         const compressedBase64 = await compressImage(file);
         const currentImages = selectedWriting.images || [];
         const updatedImages = [...currentImages, compressedBase64];
-        
-        await fetch(`/api/essays/${selectedWriting.id}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ images: updatedImages })
-        });
-        
+
+        await updateEssayInFirestore(selectedWriting.id, { images: updatedImages }, isPreviewMode);
+
         const updated = { ...selectedWriting, images: updatedImages };
         setSelectedWriting(updated);
         setWritings(writings.map((w: any) => w.id === selectedWriting.id ? updated : w));
@@ -1136,11 +1134,7 @@ const compressImage = (file: File): Promise<string> => {
       if (!selectedWriting || !selectedWriting.images) return;
       const updatedImages = selectedWriting.images.filter((_: any, i: number) => i !== index);
       try {
-        await fetch(`/api/essays/${selectedWriting.id}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ images: updatedImages })
-        });
+        await updateEssayInFirestore(selectedWriting.id, { images: updatedImages }, isPreviewMode);
         const updated = { ...selectedWriting, images: updatedImages };
         setSelectedWriting(updated);
         setWritings(writings.map((w: any) => w.id === selectedWriting.id ? updated : w));
@@ -1153,17 +1147,17 @@ const compressImage = (file: File): Promise<string> => {
       <div className="flex flex-col md:flex-row gap-4 h-auto md:h-full">
         {selectedImagePopup && (
           <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-[60]" onClick={() => setSelectedImagePopup(null)}>
-            <button 
+            <button
               className="absolute top-6 right-6 text-white/70 hover:text-white p-2 transition-colors fade-in"
               onClick={() => setSelectedImagePopup(null)}
             >
               <X className="w-8 h-8" />
             </button>
-            <img 
-              src={selectedImagePopup} 
-              alt="Enlarged view" 
-              className="max-w-3xl max-h-[80vh] w-full object-contain rounded-2xl shadow-2xl scale-in-center" 
-              onClick={(e) => e.stopPropagation()} 
+            <img
+              src={selectedImagePopup}
+              alt="Enlarged view"
+              className="max-w-3xl max-h-[80vh] w-full object-contain rounded-2xl shadow-2xl scale-in-center"
+              onClick={(e) => e.stopPropagation()}
             />
           </div>
         )}
@@ -1196,7 +1190,7 @@ const compressImage = (file: File): Promise<string> => {
                     <Button variant="outline" size="sm" className="px-2 py-1 text-xs" onClick={() => setIsLeftSidebarOpen(false)}><ChevronLeft className="w-3 h-3"/> {t.workspace.hideBtn}</Button>
                   </div>
                 </div>
-                
+
                 <div className="flex justify-between items-center mb-3">
                   <h3 className="text-xs font-bold text-[#8C7A6B]">{t.workspace.myWritings}</h3>
                   <Button variant="outline" size="sm" onClick={() => setSelectedWriting(null)} className="px-2 py-1 bg-white text-xs">
@@ -1206,10 +1200,10 @@ const compressImage = (file: File): Promise<string> => {
 
                 <div className="flex-1 overflow-y-auto space-y-2 pr-2 custom-scrollbar">
                   {writings.map(w => (
-                    <div 
-                      key={w.id} 
+                    <div
+                      key={w.id}
                       className={cn(
-                        "p-3 rounded-xl cursor-pointer transition-colors border flex justify-between items-center group", 
+                        "p-3 rounded-xl cursor-pointer transition-colors border flex justify-between items-center group",
                         selectedWriting?.id === w.id ? "border-[#D97736] bg-[#FFF8F3]" : "border-[#F3E8E0] bg-[#FDFBF7] hover:bg-white"
                       )}
                       onClick={() => setSelectedWriting(w)}
@@ -1218,7 +1212,7 @@ const compressImage = (file: File): Promise<string> => {
                         <h4 className="font-bold text-[#4A3F35] truncate text-sm">{w.title || t.common.untitled}</h4>
                         <p className="text-[10px] text-[#8C7A6B] mt-0.5">{t.quiz.tableDate}: {w.createdAt ? new Date(w.createdAt.toDate()).toLocaleDateString() : ''}</p>
                       </div>
-                      <button 
+                      <button
                         onClick={(e) => { e.stopPropagation(); setWritingToDelete(w); }}
                         className="w-6 h-6 flex items-center justify-center rounded-full text-[#8C7A6B] hover:bg-rose-50 hover:text-rose-600 opacity-0 group-hover:opacity-100 transition-opacity"
                       >
@@ -1250,32 +1244,32 @@ const compressImage = (file: File): Promise<string> => {
               {selectedWriting && (
                 <div className="flex flex-col gap-3 items-end">
                   <div className="flex bg-[#FFF8F3] p-1 rounded-xl border border-[#F3E8E0]">
-                    <button 
+                    <button
                       className={cn("px-4 py-1.5 rounded-lg text-sm font-bold transition-colors flex items-center gap-2", mode === 'view' ? "bg-white text-[#D97736] shadow-sm border border-[#F3E8E0]" : "text-[#8C7A6B] hover:text-[#4A3F35]")}
                       onClick={() => setMode('view')}
                     >
                       <Eye className="w-4 h-4" /> {t.workspace.view}
                     </button>
-                    <button 
+                    <button
                       className={cn("px-4 py-1.5 rounded-lg text-sm font-bold transition-colors flex items-center gap-2", mode === 'edit' ? "bg-white text-[#D97736] shadow-sm border border-[#F3E8E0]" : "text-[#8C7A6B] hover:text-[#4A3F35]")}
                       onClick={() => setMode('edit')}
                     >
                       <Edit3 className="w-4 h-4" /> {t.workspace.edit}
                     </button>
                   </div>
-                  
+
                   {mode === 'view' && (
                     <div className="flex items-center gap-3">
                       <span className="text-sm font-bold text-[#8C7A6B] flex items-center gap-1"><Languages className="w-4 h-4"/> {t.workspace.furigana}</span>
                       <div className="flex bg-[#FFF8F3] p-1 rounded-xl border border-[#F3E8E0]">
-                        <button 
+                        <button
                           className={cn("px-4 py-1 rounded-lg text-sm font-bold transition-colors", showFurigana ? "bg-white text-[#D97736] shadow-sm border border-[#F3E8E0]" : "text-[#8C7A6B] hover:text-[#4A3F35]")}
                           onClick={generateAndShowFurigana}
                           disabled={isProcessing}
                         >
                           {t.workspace.on}
                         </button>
-                        <button 
+                        <button
                           className={cn("px-4 py-1 rounded-lg text-sm font-bold transition-colors", !showFurigana ? "bg-white text-[#D97736] shadow-sm border border-[#F3E8E0]" : "text-[#8C7A6B] hover:text-[#4A3F35]")}
                           onClick={() => setShowFurigana(false)}
                           disabled={isProcessing}
@@ -1295,8 +1289,8 @@ const compressImage = (file: File): Promise<string> => {
                 <div className="mb-3">
                   <label className="block text-xs font-bold text-[#8C7A6B] mb-1">{t.workspace.title}</label>
                   {mode === 'edit' ? (
-                    <input 
-                      type="text" 
+                    <input
+                      type="text"
                       className="w-full p-3 text-base border border-[#F3E8E0] rounded-xl focus:ring-2 focus:ring-[#D97736] outline-none bg-[#FDFBF7]"
                       value={editedTitle}
                       onChange={e => setEditedTitle(e.target.value)}
@@ -1327,7 +1321,7 @@ const compressImage = (file: File): Promise<string> => {
                         </div>
                       )}
                       {mode === 'edit' && (
-                        <textarea 
+                        <textarea
                           className="w-full h-full min-h-[500px] p-6 bg-transparent outline-none text-base resize-none leading-[2.2] text-[#4A3F35]"
                           value={editedContent}
                           onMouseUp={handleTextSelection}
@@ -1339,7 +1333,7 @@ const compressImage = (file: File): Promise<string> => {
                       )}
                     </div>
                   </div>
-                  
+
                   {/* Image Section */}
                   <div className="mb-6 border border-[#F3E8E0] bg-white p-6 rounded-2xl shadow-sm">
                     <div className="flex items-center justify-between mb-4">
@@ -1354,15 +1348,15 @@ const compressImage = (file: File): Promise<string> => {
                       </div>
                       <div>
                         {/* Hidden file input */}
-                        <input 
-                          type="file" 
-                          id="image-upload" 
-                          className="hidden" 
-                          accept="image/*" 
-                          onChange={handleImageUpload} 
+                        <input
+                          type="file"
+                          id="image-upload"
+                          className="hidden"
+                          accept="image/*"
+                          onChange={handleImageUpload}
                         />
-                        <label 
-                          htmlFor="image-upload" 
+                        <label
+                          htmlFor="image-upload"
                           className="cursor-pointer border border-[#E8D5C8] text-[#5C4D43] hover:bg-[#FDFBF7] px-4 py-2 rounded-full font-medium transition-all flex items-center justify-center gap-2 text-sm bg-white"
                         >
                           <Camera className="w-4 h-4" /> {t.workspace.browseBtn}
@@ -1375,7 +1369,7 @@ const compressImage = (file: File): Promise<string> => {
                         {selectedWriting.images.map((imgUrl: string, idx: number) => (
                           <div key={idx} className="relative group rounded-xl overflow-hidden border border-[#F3E8E0] cursor-pointer" onClick={() => setSelectedImagePopup(imgUrl)}>
                             <img src={imgUrl} alt={`Uploaded ${idx}`} className="w-full h-32 object-cover transition-transform duration-300 group-hover:scale-105" />
-                            <button 
+                            <button
                               onClick={(e) => { e.stopPropagation(); handleRemoveImage(idx); }}
                               className="absolute top-2 right-2 bg-black/60 text-white p-1.5 rounded-full opacity-0 group-hover:opacity-100 transition-opacity hover:bg-black/80"
                             >
@@ -1385,7 +1379,7 @@ const compressImage = (file: File): Promise<string> => {
                         ))}
                       </div>
                     ) : (
-                      <div 
+                      <div
                         onDragOver={(e) => e.preventDefault()}
                         onDrop={handleImageDrop}
                         className="bg-[#FFF8F3] border border-dashed border-[#E8D5C8] rounded-xl p-8 flex flex-col items-center justify-center text-center cursor-pointer hover:bg-[rgba(255,248,243,0.8)] transition-colors"
@@ -1415,8 +1409,8 @@ const compressImage = (file: File): Promise<string> => {
               <div className="flex-1 flex flex-col min-h-0">
                 <div className="mb-4">
                   <label className="block text-xs font-bold text-[#8C7A6B] mb-2">{t.workspace.title}</label>
-                  <input 
-                    type="text" 
+                  <input
+                    type="text"
                     className="w-full p-4 text-lg border border-[#F3E8E0] rounded-2xl focus:ring-2 focus:ring-[#D97736] outline-none bg-[#FDFBF7]"
                     value={newTitle}
                     onChange={e => setNewTitle(e.target.value)}
@@ -1427,7 +1421,7 @@ const compressImage = (file: File): Promise<string> => {
                   <Button onClick={handleAdd} isLoading={isAdding} disabled={!newTitle || !newContent} size="sm"><Check className="w-4 h-4" /> {t.workspace.saveBtn}</Button>
                 </div>
                 <div className="flex-1 overflow-y-auto relative rounded-2xl border border-[#F3E8E0] bg-[#FDFBF7]">
-                  <textarea 
+                  <textarea
                     className="w-full h-full p-8 bg-transparent outline-none text-lg resize-none leading-[2.5] text-[#4A3F35]"
                     value={newContent}
                     onMouseUp={handleTextSelection}
@@ -1437,11 +1431,11 @@ const compressImage = (file: File): Promise<string> => {
                 </div>
               </div>
             )}
-            
+
             {/* Floating Action for Vocabulary */}
             <AnimatePresence>
               {selection && selectedWriting && (
-                <motion.div 
+                <motion.div
                   initial={{ opacity: 0, y: 10 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: 10 }}
@@ -1457,7 +1451,7 @@ const compressImage = (file: File): Promise<string> => {
                     <span className="text-sm font-bold text-[#4A3F35] px-1 truncate max-w-[250px]">選択: "{selection}"</span>
                     <button onClick={() => setSelection('')} className="text-[#8C7A6B] hover:text-[#4A3F35]"><X className="w-4 h-4"/></button>
                   </div>
-                  
+
                   {popupMode === 'menu' && (
                     <div className="flex flex-wrap gap-2">
                       <Button variant="outline" size="sm" onClick={handleTranslate} className="rounded-full flex-1 bg-[#FFF8F3] border-[#F3E8E0] hover:bg-[#F3E8E0] text-[#4A3F35]">
@@ -1488,7 +1482,7 @@ const compressImage = (file: File): Promise<string> => {
 
                   {popupMode === 'question' && (
                     <div className="flex flex-col gap-2">
-                      <textarea 
+                      <textarea
                         className="w-full p-2 text-sm border border-[#F3E8E0] rounded-xl focus:ring-2 focus:ring-[#D97736] outline-none bg-[#FDFBF7] resize-none"
                         rows={2}
                         placeholder={t.workspace.askPlaceholder}
@@ -1524,40 +1518,40 @@ const compressImage = (file: File): Promise<string> => {
                     <Button variant="outline" size="sm" className="px-2 py-1 text-xs" onClick={() => setIsRightSidebarOpen(false)}><ChevronRight className="w-3 h-3"/> {t.workspace.hideBtn}</Button>
                   </div>
                 </div>
-                
+
                 <div className="flex-1 overflow-y-auto custom-scrollbar pr-2">
                   <div className="space-y-2">
                     {selectedWriting?.vocabularyList?.map((v, i) => (
                       <div key={i} className="flex gap-1.5 items-start bg-[#FDFBF7] p-2 rounded-xl border border-[#F3E8E0] relative group">
                         <div className="flex-1 flex flex-col gap-0">
                           <div className="flex items-baseline gap-2">
-                            <input 
-                              type="text" 
-                              value={v.word} 
+                            <input
+                              type="text"
+                              value={v.word}
                               onChange={(e) => handleUpdateVocabulary(i, 'word', e.target.value)}
                               onBlur={handleSaveVocabularyList}
                               className="flex-[4] min-w-0 p-0.5 text-[11px] font-bold text-[#4A3F35] bg-transparent border-b border-transparent focus:border-[#D97736] outline-none"
                               placeholder={t.workspace.vocabWordPlaceholder}
                             />
-                            <input 
-                              type="text" 
-                              value={v.reading} 
+                            <input
+                              type="text"
+                              value={v.reading}
                               onChange={(e) => handleUpdateVocabulary(i, 'reading', e.target.value)}
                               onBlur={handleSaveVocabularyList}
                               className="flex-[6] min-w-0 p-0.5 text-[9px] text-[#8C7A6B] bg-transparent border-b border-transparent focus:border-[#D97736] outline-none"
                               placeholder={t.workspace.vocabReadingPlaceholder}
                             />
                           </div>
-                          <input 
-                            type="text" 
-                            value={v.meaning} 
+                          <input
+                            type="text"
+                            value={v.meaning}
                             onChange={(e) => handleUpdateVocabulary(i, 'meaning', e.target.value)}
                             onBlur={handleSaveVocabularyList}
                             className="w-full p-0.5 text-[10px] text-[#5C4D43] bg-transparent border-b border-transparent focus:border-[#D97736] outline-none"
                             placeholder={t.workspace.vocabMeaningPlaceholder}
                           />
                         </div>
-                        <button 
+                        <button
                           className="text-[#8C7A6B] hover:text-rose-500 opacity-0 group-hover:opacity-100 transition-opacity p-1"
                           onClick={() => handleRemoveVocabulary(i)}
                         >
@@ -1565,30 +1559,30 @@ const compressImage = (file: File): Promise<string> => {
                         </button>
                       </div>
                     ))}
-                    
+
                     {/* Add new row */}
                     {selectedWriting && (
                       <div className="flex gap-2 items-start bg-white p-2 rounded-xl border border-dashed border-[#D97736] relative mt-4">
                         <div className="flex-1 flex flex-col gap-1">
                           <div className="flex gap-2">
-                            <input 
-                              type="text" 
-                              value={newVocabWord} 
+                            <input
+                              type="text"
+                              value={newVocabWord}
                               onChange={(e) => setNewVocabWord(e.target.value)}
                               className="w-1/2 p-1 text-sm font-bold text-[#4A3F35] bg-transparent border-b border-transparent focus:border-[#D97736] outline-none"
                               placeholder={t.workspace.newVocabPlaceholder}
                             />
-                            <input 
-                              type="text" 
-                              value={newVocabReading} 
+                            <input
+                              type="text"
+                              value={newVocabReading}
                               onChange={(e) => setNewVocabReading(e.target.value)}
                               className="w-1/2 p-1 text-xs text-[#8C7A6B] bg-transparent border-b border-transparent focus:border-[#D97736] outline-none"
                               placeholder={t.workspace.vocabReadingPlaceholder}
                             />
                           </div>
-                          <input 
-                            type="text" 
-                            value={newVocabMeaning} 
+                          <input
+                            type="text"
+                            value={newVocabMeaning}
                             onChange={(e) => setNewVocabMeaning(e.target.value)}
                             className="w-full p-1 text-sm text-[#5C4D43] bg-transparent border-b border-transparent focus:border-[#D97736] outline-none"
                             placeholder={t.quiz.expandMeaning}
@@ -1599,7 +1593,7 @@ const compressImage = (file: File): Promise<string> => {
                             }}
                           />
                         </div>
-                        <button 
+                        <button
                           className="text-[#D97736] hover:bg-[#FFF8F3] rounded-full p-1"
                           onClick={handleManualAddVocabulary}
                           disabled={!newVocabWord}
@@ -1608,7 +1602,7 @@ const compressImage = (file: File): Promise<string> => {
                         </button>
                       </div>
                     )}
-                    
+
                     {(!selectedWriting?.vocabularyList || selectedWriting.vocabularyList.length === 0) && !selectedWriting && (
                       <div className="h-full flex items-center justify-center p-6 border border-dashed border-[#E8D5C8] rounded-2xl text-center">
                         <p className="text-sm text-[#8C7A6B]">{t.workspace.noVocab}</p>
@@ -1628,13 +1622,13 @@ const compressImage = (file: File): Promise<string> => {
                   </div>
                   <Button variant="outline" size="sm" className="px-3 py-1.5" onClick={() => setIsRightSidebarOpen(false)}><ChevronRight className="w-4 h-4"/> {t.common.fold}</Button>
                 </div>
-                
+
                 <div className="flex-1 overflow-y-auto custom-scrollbar flex flex-col gap-4">
                   {selectedWriting?.qaList && selectedWriting.qaList.length > 0 ? (
                     <div className="space-y-4">
                       {selectedWriting.qaList.map((qa, i) => (
                         <div key={i} className="space-y-2 relative group">
-                          <button 
+                          <button
                             className="absolute top-2 right-2 text-[#8C7A6B] hover:text-rose-500 opacity-0 group-hover:opacity-100 transition-opacity p-1 z-10 bg-[#FDFBF7] rounded-full"
                             onClick={() => handleRemoveQa(i)}
                           >
@@ -1682,7 +1676,7 @@ const compressImage = (file: File): Promise<string> => {
     );
   };
 
-  const QuizGenerator = ({ user, userProfile, setCurrentView, writings, articles = [], setWritings, setArticles, isProcessing, setIsProcessing, lang }: any) => {
+  const QuizGenerator = ({ user, userProfile, setCurrentView, writings, articles = [], setWritings, setArticles, isProcessing, setIsProcessing, lang, isPreviewMode }: any) => {
     const t = TRANSLATIONS[lang as Language];
     const isTeacher = userProfile?.role === 'teacher';
     const generateQuiz = async (topic: string, level: string) => {
@@ -1808,7 +1802,7 @@ const compressImage = (file: File): Promise<string> => {
 
     const handleNextVocab = async () => {
       if (!currentTestItem) return;
-      
+
       const updatedTestSet = [...testSet];
       if (exampleSentence) {
         updatedTestSet[currentVocabIndex] = { ...updatedTestSet[currentVocabIndex], example: exampleSentence };
@@ -1821,12 +1815,8 @@ const compressImage = (file: File): Promise<string> => {
             const newList = [...originalWriting.vocabularyList];
             newList[currentTestItem.vocabIndex] = { ...newList[currentTestItem.vocabIndex], example: exampleSentence };
             try {
-              await fetch(`/api/essays/${currentTestItem.writingId}`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ vocabulary_list: newList })
-              });
-              const updatedWritings = writings.map((w: any) => 
+              await updateEssayInFirestore(currentTestItem.writingId, { vocabulary_list: newList }, isPreviewMode);
+              const updatedWritings = writings.map((w: any) =>
                  w.id.toString() === currentTestItem.writingId.toString() ? { ...w, vocabularyList: newList } : w
               );
               setWritings(updatedWritings);
@@ -1840,13 +1830,9 @@ const compressImage = (file: File): Promise<string> => {
             const newList = [...originalArticle.vocabularyList];
             newList[currentTestItem.vocabIndex] = { ...newList[currentTestItem.vocabIndex], example: exampleSentence };
             try {
-              await fetch(`/api/articles/${currentTestItem.writingId}`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ vocabulary_list: newList })
-              });
+              await updateArticleInFirestore(currentTestItem.writingId, { vocabulary_list: newList }, isPreviewMode);
 
-              const updatedArticles = articles.map((a: any) => 
+              const updatedArticles = articles.map((a: any) =>
                  a.id.toString() === currentTestItem.writingId.toString() ? { ...a, vocabularyList: newList } : a
               );
               setArticles(updatedArticles);
@@ -1884,9 +1870,9 @@ const compressImage = (file: File): Promise<string> => {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
             <div>
               <label className="block text-sm font-medium text-[#5C4D43] mb-1">{t.quiz.topicLabel}</label>
-              <input 
-                type="text" 
-                placeholder={t.quiz.topicPlaceholder} 
+              <input
+                type="text"
+                placeholder={t.quiz.topicPlaceholder}
                 className="w-full p-3 border border-[#F3E8E0] rounded-xl outline-none focus:ring-2 focus:ring-[#D97736] bg-[#FDFBF7]"
                 value={topic}
                 onChange={e => setTopic(e.target.value)}
@@ -1894,7 +1880,7 @@ const compressImage = (file: File): Promise<string> => {
             </div>
             <div>
               <label className="block text-sm font-medium text-[#5C4D43] mb-1">{t.quiz.levelLabel}</label>
-              <select 
+              <select
                 className="w-full p-3 border border-[#F3E8E0] rounded-xl outline-none focus:ring-2 focus:ring-[#D97736] bg-[#FDFBF7]"
                 value={level}
                 onChange={e => setLevel(e.target.value)}
@@ -1957,8 +1943,8 @@ const compressImage = (file: File): Promise<string> => {
                     <h2 className="text-xl font-bold text-[#4A3F35]">{t.quiz.testSelectTitle}</h2>
                     <p className="text-[#8C7A6B] text-sm mt-1">{t.quiz.testSelectDesc}</p>
                   </div>
-                  <Button 
-                    variant="primary" 
+                  <Button
+                    variant="primary"
                     disabled={selectedWritingIds.length === 0}
                     onClick={startAggregatedMemoryTest}
                   >
@@ -1975,9 +1961,9 @@ const compressImage = (file: File): Promise<string> => {
                   <div className="flex-1 flex flex-col">
                     <div className="grid grid-cols-12 gap-4 px-4 py-3 text-sm font-bold text-[#8C7A6B] border-b border-[#F3E8E0] bg-[#FDFBF7] rounded-t-xl items-center">
                       <div className="col-span-1 flex justify-center">
-                        <input 
-                          type="checkbox" 
-                          className="w-4 h-4 accent-[#D97736] cursor-pointer" 
+                        <input
+                          type="checkbox"
+                          className="w-4 h-4 accent-[#D97736] cursor-pointer"
                           checked={selectedWritingIds.length === itemsWithVocab.length && itemsWithVocab.length > 0}
                           onChange={(e) => setSelectedWritingIds(e.target.checked ? itemsWithVocab.map((w: any) => w.id) : [])}
                         />
@@ -1990,7 +1976,7 @@ const compressImage = (file: File): Promise<string> => {
                     <div className="space-y-2 mt-2">
                       {itemsWithVocab.map((w: any) => (
                         <div key={w.id} className="border border-[#F3E8E0] rounded-xl overflow-hidden bg-white hover:bg-[#FDFBF7] transition-all">
-                          <div 
+                          <div
                             className={cn(
                               "grid grid-cols-12 gap-4 items-center p-3 cursor-pointer transition-colors border-l-4",
                               selectedWritingIds.includes(w.id) ? "border-l-[#D97736] bg-[#FFF8F3]" : "border-l-transparent"
@@ -1998,11 +1984,11 @@ const compressImage = (file: File): Promise<string> => {
                             onClick={() => setExpandedWritingId(prev => prev === w.id ? null : w.id)}
                           >
                             <div className="col-span-1 flex justify-center" onClick={(e) => e.stopPropagation()}>
-                              <input 
-                                type="checkbox" 
-                                checked={selectedWritingIds.includes(w.id)} 
-                                onChange={() => toggleSelection(w.id)} 
-                                className="w-5 h-5 accent-[#D97736] cursor-pointer" 
+                              <input
+                                type="checkbox"
+                                checked={selectedWritingIds.includes(w.id)}
+                                onChange={() => toggleSelection(w.id)}
+                                className="w-5 h-5 accent-[#D97736] cursor-pointer"
                               />
                             </div>
                             <div className="col-span-2 text-sm text-[#8C7A6B]">
@@ -2019,12 +2005,12 @@ const compressImage = (file: File): Promise<string> => {
                               <ChevronDown className={cn("w-5 h-5 text-[#8C7A6B] transition-transform", expandedWritingId === w.id ? "rotate-180" : "")} />
                             </div>
                           </div>
-                          
+
                           <AnimatePresence>
                             {expandedWritingId === w.id && (
-                              <motion.div 
-                                initial={{ height: 0, opacity: 0 }} 
-                                animate={{ height: "auto", opacity: 1 }} 
+                              <motion.div
+                                initial={{ height: 0, opacity: 0 }}
+                                animate={{ height: "auto", opacity: 1 }}
                                 exit={{ height: 0, opacity: 0 }}
                                 className="overflow-hidden border-t border-[#F3E8E0] bg-[#FDFBF7]"
                               >
@@ -2072,7 +2058,7 @@ const compressImage = (file: File): Promise<string> => {
                     <span className="text-sm font-bold text-[#8C7A6B]">{t.quiz.questionNum(currentVocabIndex + 1, testSet.length)}</span>
                     <Badge color="orange" className="text-xs max-w-[200px] truncate">{t.quiz.targetWriting(currentTestItem.writingTitle)}</Badge>
                   </div>
-                  
+
                   <div className="text-center mb-8">
                     <p className="text-[#8C7A6B] text-sm mb-1">{currentTestItem.reading}</p>
                     <h2 className="text-4xl font-bold text-[#4A3F35]">{currentTestItem.word}</h2>
@@ -2081,8 +2067,8 @@ const compressImage = (file: File): Promise<string> => {
                   {!testFeedback ? (
                     <div className="space-y-4">
                       <label className="block text-sm font-bold text-[#5C4D43]">{t.quiz.meaningLabel}</label>
-                      <input 
-                        type="text" 
+                      <input
+                        type="text"
                         value={userMeaningInput}
                         onChange={(e) => setUserMeaningInput(e.target.value)}
                         placeholder={t.quiz.meaningPlaceholder}
@@ -2151,7 +2137,7 @@ const compressImage = (file: File): Promise<string> => {
                       <div className="col-span-3">{t.quiz.resultMeaning}</div>
                       <div className="col-span-6">{t.quiz.resultSentence}</div>
                     </div>
-                    
+
                     <div className="space-y-3">
                       {testSet.map((v, idx) => (
                         <div key={idx} className="grid grid-cols-12 gap-4 items-center p-4 bg-[#FDFBF7] border border-[#F3E8E0] rounded-xl">
@@ -2191,7 +2177,7 @@ const compressImage = (file: File): Promise<string> => {
     );
   };
 
-  const ArticleGenerator = ({ user, userProfile, articles, setArticles, setCurrentView, isProcessing, setIsProcessing, lang, targetEmail }: any) => {
+  const ArticleGenerator = ({ user, userProfile, articles, setArticles, setCurrentView, isProcessing, setIsProcessing, lang, targetEmail, students, isPreviewMode }: any) => {
     const t = TRANSLATIONS[lang as Language];
     const isTeacher = userProfile?.role === 'teacher';
     const [topic, setTopic] = useState('');
@@ -2233,20 +2219,20 @@ const compressImage = (file: File): Promise<string> => {
         if (sel && sel.rangeCount > 0 && sel.toString().trim() !== '') {
           const range = sel.getRangeAt(0);
           const frag = range.cloneContents();
-          
+
           // Helper div to extract text content
           const div = document.createElement('div');
           div.appendChild(frag);
-          
+
           // Remove all furigana (ruby text) elements so they don't get included in the selection string
           const rtElements = div.querySelectorAll('rt');
           rtElements.forEach(rt => rt.remove());
-          
+
           const rpElements = div.querySelectorAll('rp');
           rpElements.forEach(rp => rp.remove());
 
           const text = div.textContent?.trim() || '';
-          
+
           if (text) {
             setSelection(text);
             setPopupMode('menu');
@@ -2293,7 +2279,7 @@ const compressImage = (file: File): Promise<string> => {
         const response = await ai.models.generateContent({
           model: geminiModel,
           contents: `以下の選択されたテキストから、対象となる単語（ふりがなが含まれている場合はふりがなを除いた漢字のみ）、その「よみがな」、および「英語の意味」を抽出してJSON形式で出力してください。\n\n選択テキスト: ${selection}`,
-          config: { 
+          config: {
             responseMimeType: "application/json",
             responseSchema: {
               type: Type.OBJECT,
@@ -2312,20 +2298,14 @@ const compressImage = (file: File): Promise<string> => {
         if (Array.isArray(vocab)) {
           vocab = vocab[0];
         }
-        
+
         const newList = [...vocabularyList, vocab];
         setVocabularyList(newList);
         setSelection('');
-        
+
         if (selectedArticleId) {
-          fetch(`/api/articles/${selectedArticleId}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ vocabulary_list: newList })
-          }).then(res => {
-            if (res.ok) {
-              setArticles(articles.map((a: Article) => a.id.toString() === selectedArticleId.toString() ? { ...a, vocabularyList: newList } : a));
-            }
+          updateArticleInFirestore(selectedArticleId, { vocabulary_list: newList }, isPreviewMode).then(() => {
+            setArticles(articles.map((a: Article) => a.id.toString() === selectedArticleId.toString() ? { ...a, vocabularyList: newList } : a));
           });
         }
       } catch (err) {
@@ -2334,14 +2314,8 @@ const compressImage = (file: File): Promise<string> => {
         setVocabularyList(newList);
         setSelection('');
         if (selectedArticleId) {
-          fetch(`/api/articles/${selectedArticleId}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ vocabulary_list: newList })
-          }).then(res => {
-            if (res.ok) {
-              setArticles(articles.map((a: Article) => a.id.toString() === selectedArticleId.toString() ? { ...a, vocabularyList: newList } : a));
-            }
+          updateArticleInFirestore(selectedArticleId, { vocabulary_list: newList }, isPreviewMode).then(() => {
+            setArticles(articles.map((a: Article) => a.id.toString() === selectedArticleId.toString() ? { ...a, vocabularyList: newList } : a));
           });
         }
       } finally {
@@ -2442,45 +2416,32 @@ const compressImage = (file: File): Promise<string> => {
         };
 
         if (selectedArticleId) {
-          const res = await fetch(`/api/articles/${selectedArticleId}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-          });
-          if (res.ok) {
-            const updatedArticle = {
-              id: selectedArticleId,
-              rewrittenText: result,
-              level,
-              topic: extractTitle(result) || topic,
-              vocabularyList,
-              authorId: targetEmail || user.email,
-              createdAt: articles.find(a => a.id.toString() === selectedArticleId.toString())?.createdAt || { toDate: () => new Date() }
-            } as Article;
-            setArticles(articles.map(a => a.id.toString() === selectedArticleId.toString() ? updatedArticle : a));
-            alert(lang === 'ja' ? "更新されました！" : "Updated successfully!");
-          }
+          await updateArticleInFirestore(selectedArticleId, payload, isPreviewMode);
+          const updatedArticle = {
+            id: selectedArticleId,
+            rewrittenText: result,
+            level,
+            topic: extractTitle(result) || topic,
+            vocabularyList,
+            authorId: targetEmail || user.email,
+            createdAt: articles.find(a => a.id.toString() === selectedArticleId.toString())?.createdAt || { toDate: () => new Date() }
+          } as Article;
+          setArticles(articles.map(a => a.id.toString() === selectedArticleId.toString() ? updatedArticle : a));
+          alert(lang === 'ja' ? "更新されました！" : "Updated successfully!");
         } else {
-          const res = await fetch('/api/articles', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-          });
-          if (res.ok) {
-            const { id } = await res.json();
-            const newArticle = {
-              id: id.toString(),
-              rewrittenText: result,
-              level,
-              topic: extractTitle(result) || topic,
-              vocabularyList,
-              authorId: targetEmail || user.email,
-              createdAt: { toDate: () => new Date() }
-            } as Article;
-            setArticles([newArticle, ...articles]);
-            setSelectedArticleId(id.toString());
-            alert(lang === 'ja' ? "保存されました！" : "Saved successfully!");
-          }
+          const id = await createArticleInFirestore({ currentUser: user, userProfile, targetEmail, students, isPreviewMode }, payload);
+          const newArticle = {
+            id,
+            rewrittenText: result,
+            level,
+            topic: extractTitle(result) || topic,
+            vocabularyList,
+            authorId: targetEmail || user.email,
+            createdAt: { toDate: () => new Date() }
+          } as Article;
+          setArticles([newArticle, ...articles]);
+          setSelectedArticleId(id);
+          alert(lang === 'ja' ? "保存されました！" : "Saved successfully!");
         }
       } catch (err) {
         console.error("Save failed", err);
@@ -2492,7 +2453,7 @@ const compressImage = (file: File): Promise<string> => {
     const handleDelete = async (id: string, e: React.MouseEvent) => {
       e.stopPropagation();
       try {
-        await fetch(`/api/articles/${id}`, { method: 'DELETE' });
+        await deleteArticleFromFirestore(id, isPreviewMode);
         setArticles(articles.filter(a => a.id !== id));
       } catch (err) {
         console.error("Delete failed", err);
@@ -2503,16 +2464,10 @@ const compressImage = (file: File): Promise<string> => {
       const newList = [...vocabularyList];
       newList[index] = { ...newList[index], [field]: value } as any;
       setVocabularyList(newList);
-      
+
       if (selectedArticleId) {
-        fetch(`/api/articles/${selectedArticleId}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ vocabulary_list: newList })
-        }).then(res => {
-          if (res.ok) {
-            setArticles(articles.map((a: Article) => a.id.toString() === selectedArticleId.toString() ? { ...a, vocabularyList: newList } : a));
-          }
+        updateArticleInFirestore(selectedArticleId, { vocabulary_list: newList }, isPreviewMode).then(() => {
+          setArticles(articles.map((a: Article) => a.id.toString() === selectedArticleId.toString() ? { ...a, vocabularyList: newList } : a));
         });
       }
     };
@@ -2522,16 +2477,10 @@ const compressImage = (file: File): Promise<string> => {
       const newList = [...vocabularyList, newVocab];
       setVocabularyList(newList);
       setNewVocab({ word: '', reading: '', meaning: '' });
-      
+
       if (selectedArticleId) {
-        fetch(`/api/articles/${selectedArticleId}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ vocabulary_list: newList })
-        }).then(res => {
-          if (res.ok) {
-            setArticles(articles.map((a: Article) => a.id.toString() === selectedArticleId.toString() ? { ...a, vocabularyList: newList } : a));
-          }
+        updateArticleInFirestore(selectedArticleId, { vocabulary_list: newList }, isPreviewMode).then(() => {
+          setArticles(articles.map((a: Article) => a.id.toString() === selectedArticleId.toString() ? { ...a, vocabularyList: newList } : a));
         });
       }
     };
@@ -2539,16 +2488,10 @@ const compressImage = (file: File): Promise<string> => {
     const removeVocab = (index: number) => {
       const newList = vocabularyList.filter((_, i) => i !== index);
       setVocabularyList(newList);
-      
+
       if (selectedArticleId) {
-        fetch(`/api/articles/${selectedArticleId}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ vocabulary_list: newList })
-        }).then(res => {
-          if (res.ok) {
-            setArticles(articles.map((a: Article) => a.id.toString() === selectedArticleId.toString() ? { ...a, vocabularyList: newList } : a));
-          }
+        updateArticleInFirestore(selectedArticleId, { vocabulary_list: newList }, isPreviewMode).then(() => {
+          setArticles(articles.map((a: Article) => a.id.toString() === selectedArticleId.toString() ? { ...a, vocabularyList: newList } : a));
         });
       }
     };
@@ -2578,7 +2521,7 @@ const compressImage = (file: File): Promise<string> => {
                 <div className="flex flex-col md:flex-row md:items-center gap-4">
                   <div className="flex-1">
                     <label className="block text-[10px] font-bold text-[#8C7A6B] uppercase mb-1 tracking-wider">{t.rewrite.genTopicLabel}</label>
-                    <input 
+                    <input
                       type="text"
                       placeholder={t.rewrite.genTopicPlaceholder}
                       className="w-full max-w-md p-2.5 border border-[#F3E8E0] rounded-xl outline-none focus:ring-2 focus:ring-[#D97736] bg-[#FDFBF7] text-sm"
@@ -2587,7 +2530,7 @@ const compressImage = (file: File): Promise<string> => {
                     />
                   </div>
                   <div className="flex items-center gap-2 pt-0 md:pt-4">
-                    <select 
+                    <select
                       className="p-2 border border-[#F3E8E0] rounded-xl outline-none focus:ring-2 focus:ring-[#D97736] bg-[#FDFBF7] text-sm"
                       value={level}
                       onChange={e => setLevel(e.target.value)}
@@ -2616,14 +2559,14 @@ const compressImage = (file: File): Promise<string> => {
                   <div className="flex items-center gap-3">
                     <span className="text-xs font-bold text-[#8C7A6B] flex items-center gap-1"><Languages className="w-4 h-4"/> {t.workspace.furigana}</span>
                     <div className="flex bg-[#FFF8F3] p-1 rounded-xl border border-[#F3E8E0]">
-                      <button 
+                      <button
                         className={cn("px-4 py-1 rounded-lg text-sm font-bold transition-colors", showFurigana ? "bg-white text-[#D97736] shadow-sm border border-[#F3E8E0]" : "text-[#8C7A6B] hover:text-[#4A3F35]")}
                         onClick={handleFurigana}
                         disabled={isProcessing}
                       >
                         {t.workspace.on}
                       </button>
-                      <button 
+                      <button
                         className={cn("px-4 py-1 rounded-lg text-sm font-bold transition-colors", !showFurigana ? "bg-white text-[#D97736] shadow-sm border border-[#F3E8E0]" : "text-[#8C7A6B] hover:text-[#4A3F35]")}
                         onClick={() => setShowFurigana(false)}
                         disabled={isProcessing}
@@ -2659,7 +2602,7 @@ const compressImage = (file: File): Promise<string> => {
                 {/* Floating Action for Vocabulary (WritingWorkspace style) */}
                 <AnimatePresence>
                   {selection && result && (
-                    <motion.div 
+                    <motion.div
                       initial={{ opacity: 0, y: 10 }}
                       animate={{ opacity: 1, y: 0 }}
                       exit={{ opacity: 0, y: 10 }}
@@ -2675,7 +2618,7 @@ const compressImage = (file: File): Promise<string> => {
                         <span className="text-sm font-bold text-[#4A3F35] px-1 truncate max-w-[250px]">{lang === 'ja' ? '選択' : 'Selection'}: "{selection}"</span>
                         <button onClick={() => setSelection('')} className="text-[#8C7A6B] hover:text-[#4A3F35]"><X className="w-4 h-4"/></button>
                       </div>
-                      
+
                       {popupMode === 'menu' && (
                         <div className="flex flex-wrap gap-2">
                           <Button variant="outline" size="sm" onClick={handleTranslate} className="rounded-full flex-1 bg-[#FFF8F3] border-[#F3E8E0] hover:bg-[#F3E8E0] text-[#4A3F35]">
@@ -2715,18 +2658,18 @@ const compressImage = (file: File): Promise<string> => {
                 <h3 className="text-lg font-bold text-[#4A3F35]">{t.rewrite.memoryBank}</h3>
               </div>
               <p className="text-xs text-[#8C7A6B] mb-4">{t.rewrite.memoryBankDesc}</p>
-              
+
               <div className="space-y-3 mb-6">
                 <div className="grid grid-cols-2 gap-2">
-                  <input 
-                    type="text" 
+                  <input
+                    type="text"
                     placeholder={t.rewrite.vocabWord}
                     className="p-2 border border-[#F3E8E0] rounded-lg text-sm bg-white outline-none focus:ring-1 focus:ring-[#D97736]"
                     value={newVocab.word}
                     onChange={e => setNewVocab({...newVocab, word: e.target.value})}
                   />
-                  <input 
-                    type="text" 
+                  <input
+                    type="text"
                     placeholder={t.rewrite.vocabReading}
                     className="p-2 border border-[#F3E8E0] rounded-lg text-sm bg-white outline-none focus:ring-1 focus:ring-[#D97736]"
                     value={newVocab.reading}
@@ -2734,8 +2677,8 @@ const compressImage = (file: File): Promise<string> => {
                   />
                 </div>
                 <div className="flex gap-2">
-                  <input 
-                    type="text" 
+                  <input
+                    type="text"
                     placeholder={t.rewrite.vocabMeaning}
                     className="flex-1 p-2 border border-[#F3E8E0] rounded-lg text-sm bg-white outline-none focus:ring-1 focus:ring-[#D97736]"
                     value={newVocab.meaning}
@@ -2753,31 +2696,31 @@ const compressImage = (file: File): Promise<string> => {
                     <div key={i} className="flex gap-1.5 items-start bg-white p-2 rounded-xl border border-[#F3E8E0] relative group shadow-sm transition-all hover:border-[#D97736]/50">
                       <div className="flex-1 flex flex-col gap-0">
                         <div className="flex items-baseline gap-2">
-                          <input 
-                            type="text" 
-                            value={v.word} 
+                          <input
+                            type="text"
+                            value={v.word}
                             onChange={(e) => handleUpdateVocabulary(i, 'word', e.target.value)}
                             className="flex-[4] min-w-0 p-0.5 text-[11px] font-bold text-[#4A3F35] bg-transparent border-b border-transparent focus:border-[#D97736] outline-none"
                             placeholder={t.rewrite.vocabWord}
                           />
-                          <input 
-                            type="text" 
-                            value={v.reading} 
+                          <input
+                            type="text"
+                            value={v.reading}
                             onChange={(e) => handleUpdateVocabulary(i, 'reading', e.target.value)}
                             className="flex-[6] min-w-0 p-0.5 text-[9px] text-[#8C7A6B] bg-transparent border-b border-transparent focus:border-[#D97736] outline-none"
                             placeholder={t.rewrite.vocabReading}
                           />
                         </div>
-                        <input 
-                          type="text" 
-                          value={v.meaning} 
+                        <input
+                          type="text"
+                          value={v.meaning}
                           onChange={(e) => handleUpdateVocabulary(i, 'meaning', e.target.value)}
                           className="w-full p-0.5 text-[10px] text-[#5C4D43] bg-transparent border-b border-transparent focus:border-[#D97736] outline-none"
                           placeholder={t.rewrite.vocabMeaning}
                         />
                       </div>
-                      <button 
-                        onClick={() => removeVocab(i)} 
+                      <button
+                        onClick={() => removeVocab(i)}
                         className="w-5 h-5 flex items-center justify-center rounded-full text-[#E8D5C8] hover:bg-rose-50 hover:text-rose-500 opacity-0 group-hover:opacity-100 transition-all shadow-sm bg-white border border-[#F3E8E0]"
                       >
                         <X className="w-3 h-3" />
@@ -2803,8 +2746,8 @@ const compressImage = (file: File): Promise<string> => {
           </h2>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
             {articles.map((article: Article) => (
-              <Card 
-                key={article.id} 
+              <Card
+                key={article.id}
                 onClick={() => loadArticle(article)}
                 className="p-5 border border-[#F3E8E0] hover:border-[#D97736] transition-all group relative cursor-pointer bg-white flex flex-col justify-between"
               >
@@ -2837,9 +2780,9 @@ const compressImage = (file: File): Promise<string> => {
                 <div className="text-[10px] text-[#8C7A6B] font-mono border-t border-[#F3E8E0] pt-2 flex items-center justify-between">
                   <span className="flex items-center gap-1">
                     <Bookmark className="w-3 h-3" />
-                    {article.createdAt?.toDate 
-                      ? new Date(article.createdAt.toDate()).toLocaleDateString() 
-                      : article.createdAt?.seconds 
+                    {article.createdAt?.toDate
+                      ? new Date(article.createdAt.toDate()).toLocaleDateString()
+                      : article.createdAt?.seconds
                         ? new Date(article.createdAt.seconds * 1000).toLocaleDateString()
                         : new Date().toLocaleDateString()
                     }
@@ -2860,7 +2803,268 @@ const compressImage = (file: File): Promise<string> => {
   };
 
 
+
+const upsertUserDocument = async ({
+  uid,
+  email,
+  displayName,
+  role,
+  isTestUser,
+}: {
+  uid: string;
+  email: string;
+  displayName: string;
+  role: 'teacher' | 'student';
+  isTestUser: boolean;
+}) => {
+  const userRef = doc(db, 'users', uid);
+  const snapshot = await getDoc(userRef);
+
+  // TODO(firebase-migration): move allow-list + role assignment to trusted backend (Functions).
+  if (!snapshot.exists()) {
+    await setDoc(userRef, {
+      uid,
+      email,
+      displayName,
+      role,
+      status: 'active',
+      isTestUser,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+      lastLoginAt: serverTimestamp(),
+    });
+    return;
+  }
+
+  await setDoc(
+    userRef,
+    {
+      uid,
+      email,
+      displayName,
+      role,
+      status: 'active',
+      isTestUser,
+      updatedAt: serverTimestamp(),
+      lastLoginAt: serverTimestamp(),
+    },
+    { merge: true }
+  );
+};
+
+
+const fetchStudentsFromFirestore = async (params: {
+  uid: string;
+  email: string;
+  role: 'teacher' | 'student';
+}): Promise<Student[]> => {
+  const studentsRef = collection(db, 'students');
+
+  if (params.role === 'teacher') {
+    const q = query(studentsRef, where('role', '==', 'student'));
+    const snap = await getDocs(q);
+    return snap.docs.map((d) => {
+      const data = d.data() as any;
+      return {
+        uid: data.uid || d.id,
+        email: (data.email || '').toLowerCase(),
+        name: data.name || data.displayName || data.email || '',
+        role: 'student',
+      } as Student;
+    });
+  }
+
+  // Student can fetch only own student profile.
+  // IMPORTANT: use getDoc (not list/query) so this works with strict rules (student has no list permission).
+  const normalizedEmail = params.email.toLowerCase().trim();
+
+  const byUidRef = doc(db, 'students', params.uid);
+  const byUidSnap = await getDoc(byUidRef);
+  if (byUidSnap.exists()) {
+    const data = byUidSnap.data() as any;
+    return [{
+      uid: data.uid || byUidSnap.id,
+      email: (data.email || normalizedEmail).toLowerCase(),
+      name: data.name || data.displayName || normalizedEmail,
+      role: 'student',
+    }];
+  }
+
+  // Fallback pattern for transitional data where docId may be email.
+  const byEmailRef = doc(db, 'students', normalizedEmail);
+  const byEmailSnap = await getDoc(byEmailRef);
+  if (byEmailSnap.exists()) {
+    const data = byEmailSnap.data() as any;
+    return [{
+      email: (data.email || normalizedEmail).toLowerCase(),
+      name: data.name || data.displayName || normalizedEmail,
+      role: 'student',
+    }];
+  }
+
+  return [];
+};
+
+
+type Role = 'teacher' | 'student';
+
+type OwnerContext = {
+  currentUser: SimpleUser;
+  userProfile: UserProfile;
+  targetEmail?: string | null;
+  students?: Student[];
+  isPreviewMode?: boolean;
+};
+
+const toDateLike = (value: any) => {
+  if (value?.toDate) return value;
+  if (value?.seconds) return { toDate: () => new Date(value.seconds * 1000) };
+  if (value instanceof Date) return { toDate: () => value };
+  return { toDate: () => new Date() };
+};
+
+const assertWritableContext = (ctx: OwnerContext) => {
+  if (ctx.isPreviewMode) {
+    throw new Error('Dev Preview Mode is read-only. Turn it off and use Firebase Auth to save data.');
+  }
+};
+
+const resolveOwnerContext = ({ currentUser, userProfile, targetEmail, students = [] }: OwnerContext) => {
+  const normalizedEmail = (targetEmail || currentUser.email).toLowerCase().trim();
+  const matchedStudent = students.find((student) => student.email.toLowerCase() === normalizedEmail);
+  const isTeacher = userProfile.role === 'teacher';
+  const ownerUid = isTeacher ? (matchedStudent?.uid || normalizedEmail) : currentUser.uid;
+
+  return {
+    ownerUid,
+    ownerEmail: normalizedEmail,
+    studentId: matchedStudent?.uid || ownerUid,
+    teacherUid: isTeacher ? currentUser.uid : null,
+  };
+};
+
+const mapEssayDoc = (id: string, data: any): Writing => ({
+  id,
+  title: data.title || '',
+  content: data.content || '',
+  correctedContent: data.correctedContent ?? data.correction,
+  feedback: data.feedback,
+  furiganaContent: data.furiganaContent ?? data.furigana_content,
+  qaList: data.qaList ?? data.qa_list ?? [],
+  vocabularyList: data.vocabularyList ?? data.vocabulary_list ?? [],
+  images: data.images ?? [],
+  authorId: data.ownerEmail || data.student_email || data.authorId || '',
+  createdAt: toDateLike(data.createdAt ?? data.date),
+});
+
+const mapArticleDoc = (id: string, data: any): Article => ({
+  id,
+  rewrittenText: data.rewrittenText ?? data.rewritten_text ?? '',
+  level: data.level || '',
+  topic: data.topic,
+  vocabularyList: data.vocabularyList ?? data.vocabulary_list ?? [],
+  authorId: data.ownerEmail || data.author_email || data.authorId || '',
+  createdAt: toDateLike(data.createdAt ?? data.created_at),
+});
+
+const normalizeEssayUpdate = (payload: any) => {
+  const normalized: any = { updatedAt: serverTimestamp() };
+  if ('title' in payload) normalized.title = payload.title;
+  if ('content' in payload) normalized.content = payload.content;
+  if ('correction' in payload) normalized.correctedContent = payload.correction;
+  if ('feedback' in payload) normalized.feedback = payload.feedback;
+  if ('furigana_content' in payload) normalized.furiganaContent = payload.furigana_content;
+  if ('qa_list' in payload) normalized.qaList = payload.qa_list;
+  if ('vocabulary_list' in payload) normalized.vocabularyList = payload.vocabulary_list;
+  if ('images' in payload) normalized.images = payload.images;
+  return normalized;
+};
+
+const normalizeArticleUpdate = (payload: any) => {
+  const normalized: any = { updatedAt: serverTimestamp() };
+  if ('rewritten_text' in payload) normalized.rewrittenText = payload.rewritten_text;
+  if ('level' in payload) normalized.level = payload.level;
+  if ('topic' in payload) normalized.topic = payload.topic;
+  if ('vocabulary_list' in payload) normalized.vocabularyList = payload.vocabulary_list;
+  return normalized;
+};
+
+const createEssayInFirestore = async (ctx: OwnerContext, data: { title: string; content: string }) => {
+  assertWritableContext(ctx);
+  const owner = resolveOwnerContext(ctx);
+  const docRef = await addDoc(collection(db, 'essays'), {
+    ...owner,
+    title: data.title,
+    content: data.content,
+    correctedContent: null,
+    feedback: null,
+    furiganaContent: null,
+    qaList: [],
+    vocabularyList: [],
+    images: [],
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  });
+  return docRef.id;
+};
+
+const updateEssayInFirestore = async (essayId: string, payload: any, isPreviewMode = false) => {
+  if (isPreviewMode) throw new Error('Dev Preview Mode is read-only.');
+  await updateDoc(doc(db, 'essays', essayId), normalizeEssayUpdate(payload));
+};
+
+const deleteEssayFromFirestore = async (essayId: string, isPreviewMode = false) => {
+  if (isPreviewMode) throw new Error('Dev Preview Mode is read-only.');
+  await deleteDoc(doc(db, 'essays', essayId));
+};
+
+const fetchEssaysFromFirestore = async (ctx: OwnerContext) => {
+  const owner = resolveOwnerContext(ctx);
+  const essaysRef = collection(db, 'essays');
+  const q = ctx.userProfile.role === 'teacher'
+    ? query(essaysRef, where('ownerEmail', '==', owner.ownerEmail), orderBy('createdAt', 'desc'))
+    : query(essaysRef, where('ownerUid', '==', ctx.currentUser.uid), orderBy('createdAt', 'desc'));
+  const snap = await getDocs(q);
+  return snap.docs.map((essayDoc) => mapEssayDoc(essayDoc.id, essayDoc.data()));
+};
+
+const createArticleInFirestore = async (ctx: OwnerContext, payload: any) => {
+  assertWritableContext(ctx);
+  const owner = resolveOwnerContext(ctx);
+  const docRef = await addDoc(collection(db, 'articles'), {
+    ...owner,
+    rewrittenText: payload.rewritten_text,
+    level: payload.level,
+    topic: payload.topic,
+    vocabularyList: payload.vocabulary_list || [],
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  });
+  return docRef.id;
+};
+
+const updateArticleInFirestore = async (articleId: string, payload: any, isPreviewMode = false) => {
+  if (isPreviewMode) throw new Error('Dev Preview Mode is read-only.');
+  await updateDoc(doc(db, 'articles', articleId), normalizeArticleUpdate(payload));
+};
+
+const deleteArticleFromFirestore = async (articleId: string, isPreviewMode = false) => {
+  if (isPreviewMode) throw new Error('Dev Preview Mode is read-only.');
+  await deleteDoc(doc(db, 'articles', articleId));
+};
+
+const fetchArticlesFromFirestore = async (ctx: OwnerContext) => {
+  const owner = resolveOwnerContext(ctx);
+  const articlesRef = collection(db, 'articles');
+  const q = ctx.userProfile.role === 'teacher'
+    ? query(articlesRef, where('ownerEmail', '==', owner.ownerEmail), orderBy('createdAt', 'desc'))
+    : query(articlesRef, where('ownerUid', '==', ctx.currentUser.uid), orderBy('createdAt', 'desc'));
+  const snap = await getDocs(q);
+  return snap.docs.map((articleDoc) => mapArticleDoc(articleDoc.id, articleDoc.data()));
+};
+
 interface SimpleUser {
+  uid: string;
   email: string;
   displayName: string;
   photoURL?: string;
@@ -2877,42 +3081,135 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [language, setLanguage] = useState<Language>('ja');
-  const [loginEmail, setLoginEmail] = useState('');
+  const [devPreviewMode, setDevPreviewMode] = useState<DevPreviewMode>('off');
 
   // Teacher-specific state
   const [students, setStudents] = useState<Student[]>([]);
   const [selectedStudentEmail, setSelectedStudentEmail] = useState<string | null>(null);
 
-  // Auth Integration with SQLite Users
+  const devPreviewUser = getDevPreviewUser(devPreviewMode);
+  const isPreviewMode = !!devPreviewUser;
+  const activeUser = isPreviewMode ? {
+    uid: devPreviewUser.uid,
+    email: devPreviewUser.email,
+    displayName: devPreviewUser.displayName,
+  } : user;
+  const activeUserProfile = isPreviewMode ? {
+    uid: devPreviewUser.uid,
+    email: devPreviewUser.email,
+    displayName: devPreviewUser.displayName,
+    role: devPreviewUser.role,
+  } : userProfile;
+  const activeStudents = isPreviewMode ? DEV_PREVIEW_STUDENTS : students;
+  const activeSelectedStudentEmail = isPreviewMode && devPreviewUser.role === 'teacher'
+    ? DEV_PREVIEW_STUDENTS[0].email
+    : selectedStudentEmail;
+
+  // Auth Integration (Step 5-1): Firebase Google Sign-In + existing SQLite profile bridge
   useEffect(() => {
-    const savedUser = localStorage.getItem('nihongo_session');
-    if (savedUser) {
-      const u = JSON.parse(savedUser);
-      loadUserProfile(u.email);
-    } else {
-      setLoading(false);
-    }
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (!firebaseUser || !firebaseUser.email) {
+        setUser(null);
+        setUserProfile(null);
+        setLoading(false);
+        return;
+      }
+
+      const normalizedEmail = firebaseUser.email.toLowerCase().trim();
+      const allowedRole = getAllowedRoleByEmail(normalizedEmail);
+
+      // TODO(firebase-migration): Move allow-list checks to Firestore `allowed_users` or Cloud Functions.
+      if (!allowedRole) {
+        setError(language === 'ja' ? 'このアカウントにはアクセス権がありません。' : 'This account does not have access.');
+        await signOut(auth);
+        setLoading(false);
+        return;
+      }
+
+      const simpleUser = {
+        uid: firebaseUser.uid,
+        email: normalizedEmail,
+        displayName: firebaseUser.displayName || normalizedEmail,
+        photoURL: firebaseUser.photoURL || undefined,
+      };
+
+      await upsertUserDocument({
+        uid: simpleUser.uid,
+        email: simpleUser.email,
+        displayName: simpleUser.displayName,
+        role: allowedRole,
+        isTestUser: isTestStudentEmail(normalizedEmail),
+      });
+
+      setUser(simpleUser as any);
+
+      // TODO(firebase-migration): Replace /api/user/:email dependency with Firestore users/{uid} lookup.
+      // For Step 5-3, we still use backend profile sync while keeping Firestore users/{uid} in sync.
+      await loadUserProfile(normalizedEmail, allowedRole);
+    });
+
+    return () => unsubscribe();
   }, []);
 
-  const loadUserProfile = async (email: string) => {
+  const loadUserProfile = async (email: string, fallbackRole?: 'teacher' | 'student') => {
     setLoading(true);
     try {
-      const res = await fetch(`/api/user/${email.toLowerCase().trim()}`);
+      const normalizedEmail = email.toLowerCase().trim();
+      const res = await fetch(`/api/user/${normalizedEmail}`);
       if (res.ok) {
         const profile = await res.json();
-        setUserProfile(profile);
-        const simpleUser = { email: profile.email, displayName: profile.name };
+        setUserProfile({ ...profile, email: normalizedEmail, role: profile.role || fallbackRole } as UserProfile);
+        const simpleUser = { uid: profile.uid || profile.email, email: normalizedEmail, displayName: profile.name };
         setUser(simpleUser);
         localStorage.setItem('nihongo_session', JSON.stringify(simpleUser));
-        
-        if (profile.role === 'teacher') {
-          const sRes = await fetch('/api/students');
-          if (sRes.ok) setStudents(await sRes.json());
+
+        const normalizedRole = (profile.role || fallbackRole) as 'teacher' | 'student';
+
+        try {
+          const firestoreStudents = await fetchStudentsFromFirestore({
+            uid: simpleUser.uid,
+            email: normalizedEmail,
+            role: normalizedRole,
+          });
+          setStudents(firestoreStudents);
+        } catch (firestoreErr) {
+          console.error('Students load from Firestore failed:', firestoreErr);
+          setStudents([]);
+        }
+
+        if (normalizedRole === 'teacher') {
           setCurrentView('dashboard');
         } else {
           setSelectedStudentEmail(profile.email);
           setCurrentView('dashboard');
         }
+        setError(null);
+      } else if (fallbackRole) {
+        // Temporary fallback while `/api/user/:email` still exists; allows role derivation from allow-list.
+        const fallbackUid = user?.uid || normalizedEmail;
+        setUserProfile({
+          uid: fallbackUid,
+          email: normalizedEmail,
+          displayName: user?.displayName || normalizedEmail,
+          role: fallbackRole,
+        });
+
+        try {
+          const firestoreStudents = await fetchStudentsFromFirestore({
+            uid: fallbackUid,
+            email: normalizedEmail,
+            role: fallbackRole,
+          });
+          setStudents(firestoreStudents);
+        } catch (firestoreErr) {
+          console.error('Students load from Firestore failed:', firestoreErr);
+          setStudents([]);
+        }
+
+        if (fallbackRole === 'student') {
+          setSelectedStudentEmail(normalizedEmail);
+        }
+        setCurrentView('dashboard');
         setError(null);
       } else {
         setError(language === 'ja' ? "登録されていないメールアドレスです。" : "Email not found in our records.");
@@ -2927,66 +3224,59 @@ export default function App() {
 
   const handleLogin = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (!loginEmail) return;
     setIsProcessing(true);
-    await loadUserProfile(loginEmail.toLowerCase().trim());
-    setIsProcessing(false);
+    setError(null);
+    try {
+      const provider = new GoogleAuthProvider();
+      await signInWithPopup(auth, provider);
+    } catch (err) {
+      console.error('Google sign-in failed:', err);
+      setError(language === 'ja' ? 'Googleログインに失敗しました。' : 'Google sign-in failed.');
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
-  const handleLogout = () => {
-    setUser(null);
-    setUserProfile(null);
-    localStorage.removeItem('nihongo_session');
-    setCurrentView('dashboard');
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+    } finally {
+      setUser(null);
+      setUserProfile(null);
+      localStorage.removeItem('nihongo_session');
+      setCurrentView('dashboard');
+    }
   };
 
   // Fetch Writings & Articles
   useEffect(() => {
-    if (!user || !userProfile) return;
-    
-    const targetEmail = userProfile.role === 'teacher' ? (selectedStudentEmail || user.email) : user.email;
+    if (!activeUser || !activeUserProfile) return;
+
+    if (isPreviewMode) {
+      setWritings([]);
+      setArticles([]);
+      return;
+    }
+
+    const targetEmail = activeUserProfile.role === 'teacher' ? (activeSelectedStudentEmail || activeUser.email) : activeUser.email;
     if (!targetEmail) return;
 
     const loadData = async () => {
       try {
-        const wRes = await fetch(`/api/essays/${targetEmail}`);
-        if (wRes.ok) {
-          const rawWritings = await wRes.json();
-          setWritings(rawWritings.map((w: any) => ({
-            id: w.id.toString(),
-            title: w.title,
-            content: w.content,
-            correctedContent: w.correction,
-            feedback: w.feedback,
-            furiganaContent: w.furigana_content,
-            qaList: w.qa_list,
-            vocabularyList: w.vocabulary_list,
-            images: w.images,
-            authorId: w.student_email,
-            createdAt: { toDate: () => new Date(w.date) }
-          })));
-        }
-
-        const aRes = await fetch(`/api/articles?email=${targetEmail}`);
-        if (aRes.ok) {
-          const rawArticles = await aRes.json();
-          setArticles(rawArticles.map((a: any) => ({
-            id: a.id.toString(),
-            rewrittenText: a.rewritten_text,
-            level: a.level,
-            topic: a.topic,
-            vocabularyList: a.vocabulary_list,
-            authorId: a.author_email,
-            createdAt: { toDate: () => new Date(a.created_at) }
-          })));
-        }
+        const ownerContext = { currentUser: activeUser, userProfile: activeUserProfile, targetEmail, students: activeStudents, isPreviewMode };
+        const [firestoreWritings, firestoreArticles] = await Promise.all([
+          fetchEssaysFromFirestore(ownerContext),
+          fetchArticlesFromFirestore(ownerContext),
+        ]);
+        setWritings(firestoreWritings);
+        setArticles(firestoreArticles);
       } catch (err) {
         console.error("Data load error:", err);
       }
     };
 
     loadData();
-  }, [user, userProfile, selectedStudentEmail]);
+  }, [activeUser, activeUserProfile, activeSelectedStudentEmail, activeStudents, isPreviewMode]);
 
   // --- Gemini Functions ---
 
@@ -3008,7 +3298,7 @@ export default function App() {
 
 
 
-  if (loading) {
+  if (loading && !isPreviewMode) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-[#FDFBF7]">
         <Loader2 className="w-8 h-8 text-[#D97736] animate-spin" />
@@ -3016,20 +3306,21 @@ export default function App() {
     );
   }
 
-  if (!user) {
+  if (!activeUser) {
     const t = TRANSLATIONS[language];
     return (
       <div className="min-h-screen flex items-center justify-center bg-[#FDFBF7] p-4 font-sans">
+        <DevPreviewPanel mode={devPreviewMode} onChange={setDevPreviewMode} />
         <Card className="max-w-md w-full p-10 text-center space-y-8 border border-[#F3E8E0] relative shadow-2xl rounded-[3rem]">
           <div className="absolute top-6 right-6">
              <div className="flex bg-[#F3E8E0] p-1 rounded-full border border-[#E8D5C8]">
-              <button 
+              <button
                 onClick={() => setLanguage('ja')}
                 className={cn("px-3 py-1 rounded-full text-[10px] font-bold transition-all", language === 'ja' ? "bg-[#D97736] text-white shadow-md" : "text-[#8C7A6B] hover:text-[#4A3F35]")}
               >
                 JP
               </button>
-              <button 
+              <button
                 onClick={() => setLanguage('en')}
                 className={cn("px-3 py-1 rounded-full text-[10px] font-bold transition-all", language === 'en' ? "bg-[#D97736] text-white shadow-md" : "text-[#8C7A6B] hover:text-[#4A3F35]")}
               >
@@ -3044,24 +3335,14 @@ export default function App() {
             <h1 className="text-4xl font-extrabold text-[#4A3F35] tracking-tight">{t.login.title}</h1>
             <p className="text-[#8C7A6B] text-lg font-medium">{t.login.desc}</p>
           </div>
-          
-          <form onSubmit={handleLogin} className="space-y-4 text-left">
-            <div className="space-y-2">
-              <label className="text-[10px] font-bold text-[#8C7A6B] uppercase tracking-widest ml-1">Email Address</label>
-              <div className="relative">
-                <Mail className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-[#8C7A6B]" />
-                <input 
-                  type="email" 
-                  placeholder="your@email.com"
-                  required
-                  className="w-full pl-12 pr-4 py-4 bg-[#FDFBF7] border-2 border-[#F3E8E0] rounded-3xl outline-none focus:border-[#D97736] transition-all text-[#4A3F35] font-medium"
-                  value={loginEmail}
-                  onChange={e => setLoginEmail(e.target.value)}
-                />
-              </div>
-            </div>
+
+          <div className="space-y-4">
+            <Button className="w-full py-5 text-xl rounded-3xl shadow-lg shadow-[#D97736]/20" onClick={handleLogin} isLoading={isProcessing}>
+              <Globe className="w-5 h-5" />
+              {t.login.btn}
+            </Button>
             {error && (
-              <motion.div 
+              <motion.div
                 initial={{ opacity: 0, y: -10 }}
                 animate={{ opacity: 1, y: 0 }}
                 className="flex items-center gap-2 p-3 bg-red-50 text-red-600 rounded-2xl text-sm font-medium border border-red-100"
@@ -3070,10 +3351,7 @@ export default function App() {
                 {error}
               </motion.div>
             )}
-            <Button className="w-full py-5 text-xl rounded-3xl shadow-lg shadow-[#D97736]/20" onClick={handleLogin} isLoading={isProcessing}>
-              {language === 'ja' ? 'ログイン' : 'Login'}
-            </Button>
-          </form>
+          </div>
 
           <p className="text-xs text-[#8C7A6B] leading-relaxed px-4">{t.login.tos}</p>
         </Card>
@@ -3081,7 +3359,7 @@ export default function App() {
     );
   }
 
-  if (!userProfile) {
+  if (!activeUserProfile) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-[#FDFBF7] p-4 text-center">
         <Card className="p-8 space-y-4">
@@ -3111,13 +3389,13 @@ export default function App() {
           </div>
           <div className="flex items-center gap-4">
             <div className="flex bg-[#F3E8E0] p-1 rounded-full border border-[#E8D5C8]">
-              <button 
+              <button
                 onClick={() => setLanguage('ja')}
                 className={cn("px-2 py-0.5 rounded-full text-[10px] font-bold transition-all", language === 'ja' ? "bg-[#D97736] text-white shadow-sm" : "text-[#8C7A6B] hover:text-[#4A3F35]")}
               >
                 JP
               </button>
-              <button 
+              <button
                 onClick={() => setLanguage('en')}
                 className={cn("px-2 py-0.5 rounded-full text-[10px] font-bold transition-all", language === 'en' ? "bg-[#D97736] text-white shadow-sm" : "text-[#8C7A6B] hover:text-[#4A3F35]")}
               >
@@ -3125,8 +3403,8 @@ export default function App() {
               </button>
             </div>
             <div className="w-8 h-8 bg-[#D97736] text-white rounded-full border border-[#F3E8E0] flex items-center justify-center overflow-hidden">
-              {user.photoURL ? (
-                <img src={user.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+              {activeUser.photoURL ? (
+                <img src={activeUser.photoURL} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
               ) : (
                 <UserIcon className="w-4 h-4" />
               )}
@@ -3135,8 +3413,8 @@ export default function App() {
         </div>
       </nav>
 
-      <main className={cn("mx-auto transition-all w-full", 
-        currentView === 'writing-workspace' ? 'px-2 pt-2 pb-2 h-auto md:h-[calc(100vh-56px)]' : 
+      <main className={cn("mx-auto transition-all w-full",
+        currentView === 'writing-workspace' ? 'px-2 pt-2 pb-2 h-auto md:h-[calc(100vh-56px)]' :
         currentView === 'article-rewrite' ? 'px-4 pt-4 pb-8 max-w-7xl' :
         'px-4 pt-4 pb-8 max-w-5xl'
       )}>
@@ -3150,62 +3428,74 @@ export default function App() {
             className={currentView === 'writing-workspace' ? 'h-full' : ''}
           >
              {currentView === 'dashboard' && (
-               <Dashboard 
-                 user={user} 
-                 userProfile={userProfile} 
-                 handleLogout={handleLogout} 
-                 setCurrentView={setCurrentView} 
-                 writings={writings} 
-                 setSelectedWriting={setSelectedWriting} 
-                 lang={language} 
-                 students={students}
-                 selectedStudentEmail={selectedStudentEmail}
+               <Dashboard
+                 user={activeUser}
+                 userProfile={activeUserProfile}
+                 handleLogout={handleLogout}
+                 setCurrentView={setCurrentView}
+                 writings={writings}
+                 setSelectedWriting={setSelectedWriting}
+                 lang={language}
+                 students={activeStudents}
+                 selectedStudentEmail={activeSelectedStudentEmail}
                  setSelectedStudentEmail={setSelectedStudentEmail}
                />
              )}
             {currentView === 'writing-workspace' && (
-              <WritingWorkspace 
-                user={user} 
-                userProfile={userProfile} 
-                writings={writings} 
-                setWritings={setWritings} 
-                selectedWriting={selectedWriting} 
-                setSelectedWriting={setSelectedWriting} 
-                isProcessing={isProcessing} 
-                setIsProcessing={setIsProcessing} 
-                lang={language} 
+              <WritingWorkspace
+                user={activeUser}
+                userProfile={activeUserProfile}
+                writings={writings}
+                setWritings={setWritings}
+                selectedWriting={selectedWriting}
+                setSelectedWriting={setSelectedWriting}
+                isProcessing={isProcessing}
+                setIsProcessing={setIsProcessing}
+                lang={language}
+                students={activeStudents}
+                isPreviewMode={isPreviewMode}
               />
             )}
             {currentView === 'quiz-gen' && (
-              <QuizGenerator 
-                user={user} 
-                userProfile={userProfile} 
-                setCurrentView={setCurrentView} 
-                writings={writings} 
-                articles={articles} 
+              <QuizGenerator
+                user={activeUser}
+                userProfile={activeUserProfile}
+                setCurrentView={setCurrentView}
+                writings={writings}
+                articles={articles}
                 setWritings={setWritings}
                 setArticles={setArticles}
-                isProcessing={isProcessing} 
-                setIsProcessing={setIsProcessing} 
-                lang={language} 
+                isProcessing={isProcessing}
+                setIsProcessing={setIsProcessing}
+                lang={language}
+                isPreviewMode={isPreviewMode}
               />
             )}
             {currentView === 'article-rewrite' && (
-              <ArticleGenerator 
-                user={user} 
-                userProfile={userProfile} 
-                articles={articles} 
+              <ArticleGenerator
+                user={activeUser}
+                userProfile={activeUserProfile}
+                articles={articles}
                 setArticles={setArticles}
-                setCurrentView={setCurrentView} 
-                isProcessing={isProcessing} 
-                setIsProcessing={setIsProcessing} 
-                lang={language} 
-                targetEmail={userProfile?.role === 'teacher' ? (selectedStudentEmail || user?.email) : user?.email}
+                setCurrentView={setCurrentView}
+                isProcessing={isProcessing}
+                setIsProcessing={setIsProcessing}
+                lang={language}
+                targetEmail={activeUserProfile?.role === 'teacher' ? (activeSelectedStudentEmail || activeUser?.email) : activeUser?.email}
+                students={activeStudents}
+                isPreviewMode={isPreviewMode}
               />
             )}
           </motion.div>
         </AnimatePresence>
       </main>
+
+      {isPreviewMode && (
+        <div className="fixed left-4 top-20 z-[70] rounded-full border border-amber-200 bg-amber-100 px-4 py-2 text-xs font-extrabold uppercase tracking-widest text-amber-900 shadow-lg">
+          Preview Mode: {activeUserProfile.role === 'teacher' ? 'Teacher / Misaki' : 'Student / Test Student'} · writes disabled
+        </div>
+      )}
+      <DevPreviewPanel mode={devPreviewMode} onChange={setDevPreviewMode} />
 
       <footer className="w-full mx-auto px-4 py-8 text-center text-[#8C7A6B] text-sm md:max-w-5xl">
         &copy; 2026 NIHONGO AI Assistant. Built for Japanese Teachers.
